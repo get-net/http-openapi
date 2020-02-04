@@ -184,6 +184,29 @@
      end
  )
  ```
+
+## CORS handling
+Module cors is a wrapper that takes current server instance as the first argument and
+`allow` options as the second. The second argument is optional, and if it's not set then
+the default options take it's place.
+
+#### Example
+```lua
+local httpd = require("http.server").new(nil, 5000)
+local cors  = require("http.cors")
+
+-- this call returns nothing, just maps some methods
+cors(httpd, {
+    max_age = 18400, -- default value 3600
+    allow_credentials = false, -- default value true
+    allow_headers = {"Authorization", "Content-Type", "X-Requested-With"}, -- default {"Authorization", "Content-Type"} 
+    allow_origin = {"http://example.com"} -- default {"*"}
+})
+
+httpd:route({path="/api/user", method="GET"}, some_handler)
+
+httpd:start()
+```
  
  You can also wrap openapi return value inside the cors call:
  ```lua
