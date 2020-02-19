@@ -1,4 +1,4 @@
-package = "http-openapi"
+package = "gtn-openapi"
 version = "1.0.0-1"
 source = {
    url    = "git://github.com/get-net/http-openapi.git",
@@ -17,7 +17,7 @@ build = {
    type = "builtin",
 
    modules = {
-      ['http.cors'] = "cors.lua",
-      ['http.openapi'] = "openapi.lua"
+      ['gtn.cors'] = "cors.lua",
+      ['gtn.openapi'] = "openapi.lua"
    }
 }
