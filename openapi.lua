@@ -602,6 +602,15 @@ function _V.validate_query(ctx, spec, res)
             if not _V[vtype](value) then
                 _res[param.name] = _V.p_error("invalid", vtype, type(value))
             end
+
+            if param.schema.enum then
+                local ok = _V.enum(value, param.schema.enum)
+
+                if not ok and not param.schema.nullable then
+                    _res[param.name] = _V.p_error("invalid", param.schema.enum, value)
+                end
+            end
+
             return _res
         end,
         res,
@@ -738,6 +747,10 @@ function _V.array(t, param)
     end
 
     return {}
+end
+
+function _V.enum(val, options)
+    return fun.any(function(v) return val == v end, options)
 end
 
 function _V.date(str)
