@@ -2,8 +2,8 @@ package = "gtn-openapi"
 version = "1.0-1"
 source = {
    url    = "git://github.com/get-net/http-openapi.git",
-   branch = "master",
-   tag    = "master"
+   branch = "development",
+   tag    = "development"
 }
 description = {
    summary  = "Tarantool http-server OpenAPI support wrapper",
@@ -11,8 +11,7 @@ description = {
    license = "BSD"
 }
 dependencies = {
-   "lua >= 5.1",
-   "net-url"
+   "lua >= 5.1"
 }
 build = {
    type = "builtin",

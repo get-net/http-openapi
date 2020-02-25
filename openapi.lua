@@ -918,7 +918,7 @@ function _T.form_security(ctx, headers, options)
     local option = next(options)
 
     assert(ctx.openapi.components.securitySchemes, "securitySchemes component is not described")
-    local err_msg = ("Schema for %s security does not exist in securitySchemes component"):format(inspect(option))
+    local err_msg = ("Schema for %s security does not exist in securitySchemes component"):format(option)
 
     local sec_schema = assert(ctx.openapi.components.securitySchemes[option], err_msg)
 
