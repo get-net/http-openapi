@@ -799,6 +799,15 @@ function _T.start(ctx)
     return _T.httpd_start(ctx)
 end
 
+function _T.set_manual_tests()
+    _T.manual = fun.filter(
+        function(val)
+            return val:startswith("test")
+        end,
+        fio.listdir("tests")
+    ):totable()
+end
+
 function _T.set_env(ctx)
     log.info("RUNNING TESTS:\n")
 
@@ -827,6 +836,7 @@ function _T.set_env(ctx)
     end
 
     _T.server_settings = uri.parse(server_settings.url)
+    _T.set_manual_tests()
 
     return
 end
@@ -849,9 +859,22 @@ function _T.run(ctx)
     ctx.options.log_requests = false
 
     -- starts the mock server
-    _T.httpd_start(ctx)
+    local _ = _T.httpd_start(ctx)
+
+    if fio.path.exists("tests/before.lua") then
+        log.info("\nRunning before script:\n")
+        dofile("tests/before.lua")
+    end
 
     _T.run_path_tests(ctx)
+
+    log.info("Running user tests:\n")
+    _T.run_user_tests()
+
+    if fio.path.exists("tests/after.lua") then
+        log.info("\nRunning after script:\n")
+        dofile("tests/after.lua")
+    end
 
     log.info("\nTesting complete. Shutting down...\n")
     _T.httpd_stop(ctx)
@@ -895,7 +918,7 @@ function _T.form_security(ctx, headers, options)
     local option = next(options)
 
     assert(ctx.openapi.components.securitySchemes, "securitySchemes component is not described")
-    local err_msg = ("Schema for %s security does not exist in securitySchemes component"):format(option)
+    local err_msg = ("Schema for %s security does not exist in securitySchemes component"):format(inspect(option))
 
     local sec_schema = assert(ctx.openapi.components.securitySchemes[option], err_msg)
 
@@ -960,6 +983,7 @@ end
 function _T.run_path_tests(ctx)
     _T.test_config      = require("tests.config")
 
+    log.info("\nRunning automatic tests:\n")
 
     for path, options in next, ctx.openapi.paths do
         for method, opts in next, options do
@@ -1038,10 +1062,19 @@ function _T.run_path_tests(ctx)
 
             local resp_body = _T.json(resp)
             local resp_schema = opts.responses[resp.status]
-            _T.test:ok(resp_schema, ("%s RESPONSE SCHEMA EXISTS"):format(resp.status))
+            _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, path, resp.status))
 
             local expected = _T.form_expected(ctx, resp_schema)
-            _T.test:is_deeply(expected, resp_body, ("%s %s RESPONSE"):format(method, path))
+            _T.test:is_deeply(expected, resp_body, ("%s %s RESPONSE MATCH"):format(method, path))
+            log.info("\n")
+        end
+    end
+end
+
+function _T.run_user_tests()
+    for _, val in next, _T.manual do
+        if not val:match("test_before") then
+            dofile(("tests/%s"):format(val))
         end
     end
 end
