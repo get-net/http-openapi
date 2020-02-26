@@ -800,12 +800,16 @@ function _T.start(ctx)
 end
 
 function _T.set_manual_tests()
-    _T.manual = fun.filter(
-        function(val)
-            return val:startswith("test")
-        end,
-        fio.listdir("tests")
-    ):totable()
+    if fio.path.exists("tests") then
+        _T.manual = fun.filter(
+            function(val)
+                return val:startswith("test")
+            end,
+            fio.listdir("tests")
+        ):totable()
+    end
+
+    _T.manual = {}
 end
 
 function _T.set_env(ctx)
