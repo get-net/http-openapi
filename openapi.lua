@@ -976,6 +976,24 @@ function _T.form_expected(ctx, schema)
             goto redo
         end
 
+        if val.type == "array" then
+            local reffed = val.items['$ref']
+
+            if reffed then
+                local d = ctx.openapi:ref(reffed)
+                -- it's bad
+                d = _T.form_expected(ctx, {
+                    content = {
+                        [ctype] = {
+                            schema = d
+                        }
+                    }
+                })
+
+                val.example = {d}
+            end
+        end
+
         if is_properties then
             rawset(result, key, val.example)
         end
@@ -1069,6 +1087,7 @@ function _T.run_path_tests(ctx)
             _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, path, resp.status))
 
             local expected = _T.form_expected(ctx, resp_schema)
+
             _T.test:is_deeply(expected, resp_body, ("%s %s RESPONSE MATCH"):format(method, path))
             log.info("\n")
         end
