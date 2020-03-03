@@ -959,6 +959,13 @@ function _T.form_expected(ctx, schema)
 
     ::redo::
     for key, val in next, schema do
+        local s, k, path = pcall(next, val)
+
+
+        if s and k == "$ref" and path then
+            val = ctx.openapi:ref(path)
+        end
+
         if key == "$ref" then
             if not is_properties then
                 schema = ctx.openapi:ref(val)
@@ -976,12 +983,25 @@ function _T.form_expected(ctx, schema)
             goto redo
         end
 
+        -- -- it's bad
+        if val.type == "object" then
+            local d = _T.form_expected(ctx, {
+                content = {
+                    [ctype] = {
+                        schema = val
+                    }
+                }
+            })
+
+            val = {example = d}
+        end
+
+        -- yup, it's bad too
         if val.type == "array" then
             local reffed = val.items['$ref']
 
             if reffed then
                 local d = ctx.openapi:ref(reffed)
-                -- it's bad
                 d = _T.form_expected(ctx, {
                     content = {
                         [ctype] = {
@@ -990,7 +1010,7 @@ function _T.form_expected(ctx, schema)
                     }
                 })
 
-                val.example = {d}
+                val = {example = {d}}
             end
         end
 
