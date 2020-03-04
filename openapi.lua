@@ -872,7 +872,6 @@ function _T.run(ctx)
 
     _T.run_path_tests(ctx)
 
-    log.info("Running user tests:\n")
     _T.run_user_tests()
 
     if fio.path.exists("tests/after.lua") then
@@ -978,13 +977,18 @@ function _T.form_expected(ctx, schema)
 
         if schema.content then
             ctype = next(schema.content)
+            if schema.content[ctype].schema['$ref'] then
+                schema = ctx.openapi:ref(schema.content[ctype].schema['$ref'])
+                goto redo
+            end
+
             schema = schema.content[ctype].schema.properties
             is_properties = true
             goto redo
         end
 
         -- -- it's bad
-        if val.type == "object" then
+        if val.type == "object" and not val.example then
             local d = _T.form_expected(ctx, {
                 content = {
                     [ctype] = {
@@ -997,7 +1001,7 @@ function _T.form_expected(ctx, schema)
         end
 
         -- yup, it's bad too
-        if val.type == "array" then
+        if val.type == "array" and not val.example then
             local reffed = val.items['$ref']
 
             if reffed then
@@ -1038,6 +1042,7 @@ function _T.run_path_tests(ctx)
                 end
             end
 
+
             if opts.requestBody then
                 ctype = next(opts.requestBody.content)
 
@@ -1052,7 +1057,9 @@ function _T.run_path_tests(ctx)
             local params = ctx.openapi:form_params(path, method, ctype)
 
             local body, query = {}, {}
+
             if method ~= "get" and params.body then
+                params.body.required = params.body.required or {}
                 body = fun.map(
                     function(name, vars)
                         --[[
@@ -1106,18 +1113,26 @@ function _T.run_path_tests(ctx)
             local resp_schema = opts.responses[resp.status]
             _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, path, resp.status))
 
-            local expected = _T.form_expected(ctx, resp_schema)
+            if resp_schema then
+                local expected = _T.form_expected(ctx, resp_schema)
 
-            _T.test:is_deeply(expected, resp_body, ("%s %s RESPONSE MATCH"):format(method, path))
+                _T.test:is_deeply(expected, resp_body, ("%s %s RESPONSE MATCH"):format(method, path))
+            else
+                log.info("Skipping response match. REASON: no schema")
+            end
             log.info("\n")
         end
     end
 end
 
 function _T.run_user_tests()
-    for _, val in next, _T.manual do
-        if not val:match("test_before") then
-            dofile(("tests/%s"):format(val))
+    if _T.manual and next(_T.manual) then
+        log.info("Running user tests:\n")
+
+        for _, val in next, _T.manual do
+            if not val:match("test_before") then
+                dofile(("tests/%s"):format(val))
+            end
         end
     end
 end
