@@ -276,8 +276,13 @@ function _U.basic(ctx)
     return creds:match("(%w+):(%w+)")
 end
 
-function _U.apiKey(ctx, name)
-    return ctx.req.headers[name:lower()]
+function _U.apiKey(ctx, name, goes_in)
+    if goes_in == "header" then
+        return ctx.req.headers[name:lower()]
+    elseif goes_in == "cookie" then
+        local val = ctx.req.headers["cookie"]
+        return val:match(("%s=([^;]*)"):format(name))
+    end
 end
 
 local function not_implemented(self, tag, operationId)
@@ -316,7 +321,7 @@ function _U.bind_security(ctx)
 
         if auth_handler then
             local scheme = security.options.scheme or security.options.type
-            local auth_data, additional = _U[scheme](ctx, security.options.name)
+            local auth_data, additional = _U[scheme](ctx, security.options.name, security.options['in'])
             if not auth_data then
                 return nil, "Authorization data not found"
             else
