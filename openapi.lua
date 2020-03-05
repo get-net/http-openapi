@@ -939,7 +939,12 @@ function _T.form_security(ctx, headers, options)
 
     if sec_type == "apiKey" then
         local value = _T.test_config.security[option]
-        rawset(headers, sec_schema.name, value)
+
+        if sec_schema['in'] == "cookie" then
+            rawset(headers, "cookie", ("%s=%s"):format(sec_schema.name, value))
+        else
+            rawset(headers, sec_schema.name, value)
+        end
     end
 
     if sec_type == "basic" then
