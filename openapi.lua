@@ -98,26 +98,7 @@ function _M:new(spec)
                         controller = sprintf("%s#%s", tag, opts.operationId)
                     end
 
-                    local auth
-                    if opts.security then
-                        local _, v = next(opts.security)
-                        local key, scope = next(v)
-                        local options
-                        if self.components.securitySchemes then
-                            options = self.components.securitySchemes[key]
-                            if not options then
-                                error(sprintf(
-                                    "Schema %s is not described in securitySchemes",
-                                    key
-                                ))
-                            end
-                        end
-                        auth = {
-                            name = key,
-                            scope = scope,
-                            options = options
-                        }
-                    end
+                    local auth = opts.security and self:parse_security_schemes(opts.security) or nil
 
                     table.insert(res, {
                         options = {
@@ -134,7 +115,31 @@ function _M:new(spec)
             )
         end
 
+        if self.security then
+            self.security = self:parse_security_schemes(self.security)
+        end
+
         return result
+    end
+
+    function self:parse_security_schemes(scheme)
+        local _, v = next(scheme)
+        local key, scope = next(v)
+        local options
+        if self.components.securitySchemes then
+            options = self.components.securitySchemes[key]
+            if not options then
+                error(sprintf(
+                    "Schema %s is not described in securitySchemes",
+                    key
+                ))
+            end
+        end
+        return {
+            name = key,
+            scope = scope,
+            options = options
+        }
     end
 
     function self:has_params(path, method, ctype)
@@ -306,7 +311,8 @@ local function bad_request(self)
 end
 
 function _U.bind_security(ctx)
-    local security = ctx.endpoint.security
+    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and ctx.httpd.openapi.security or nil)
+
     if security ~= nil then
         local auth_handler
         if not ctx.httpd.options.security then
