@@ -4,7 +4,7 @@
  #### Quickstart
  ```lua
  local server  = require("http.server").new(nil, 5000)
- local openapi = require("http.openapi")
+ local openapi = require("gtn.openapi")
  
  local httpd = openapi(server, 'api.yaml', {
      security = require("authorization")
@@ -136,7 +136,7 @@
  
  ```lua
  local server  = require("http.server").new(nil, 5000)
- local openapi = require("http.openapi")
+ local openapi = require("gtn.openapi")
  
  local httpd = openapi(server, 'api.yaml', {
      security = require("authorization")
@@ -193,7 +193,7 @@ the default options take it's place.
 #### Example
 ```lua
 local httpd = require("http.server").new(nil, 5000)
-local cors  = require("http.cors")
+local cors  = require("gtn.cors")
 
 -- this call returns nothing, just maps some methods
 cors(httpd, {
@@ -211,7 +211,7 @@ httpd:start()
  You can also wrap openapi return value inside the cors call:
  ```lua
  local server  = require("http.server").new(nil, 5000)
- local openapi = require("http.openapi")
+ local openapi = require("gtn.openapi")
  
  local httpd = openapi(server, 'api.yaml', {
      security = require("authorization")
