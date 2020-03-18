@@ -116,7 +116,7 @@ function _M:new(spec)
         end
 
         if self.security then
-            self.security = self:parse_security_schemes(self.security)
+            self.global_security = self:parse_security_schemes(self.security)
         end
 
         return result
@@ -311,7 +311,7 @@ local function bad_request(self)
 end
 
 function _U.bind_security(ctx)
-    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and ctx.httpd.openapi.security or nil)
+    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and ctx.httpd.openapi.global_security)
 
     if security ~= nil then
         local auth_handler
@@ -1054,6 +1054,10 @@ function _T.run_path_tests(ctx)
 
             if opts.security then
                 for _, val in next, opts.security do
+                    _T.form_security(ctx, headers, val)
+                end
+            elseif ctx.openapi.security then
+                for _, val in next, ctx.openapi.security do
                     _T.form_security(ctx, headers, val)
                 end
             end
