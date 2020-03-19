@@ -643,6 +643,11 @@ end
 
 function _V.object(val, spec, ctx)
     if not _V.is_object(val) then
+        -- in case of no actual parameters and no required ones
+        if not next(val) and not spec.required then
+            return {}
+        end
+
         local first_run = (_V.runs == 0)
         return first_run and _V.p_error("invalid", "object", type(val)) or false
     end
