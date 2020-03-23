@@ -173,7 +173,7 @@
  -- the second return value of our `bearerAuth`, `apiKeyAuth` and `basicAuth` functions will be here
  httpd:security_error_handler(
      function(ctx, err)
-         return self:render({
+         return ctx:render({
              status = 401,
              json = {
                  success = false,
