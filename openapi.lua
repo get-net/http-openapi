@@ -286,7 +286,8 @@ function _U.apiKey(ctx, name, goes_in)
         return ctx.req.headers[name:lower()]
     elseif goes_in == "cookie" then
         local val = ctx.req.headers["cookie"]
-        return val:match(("%s=([^;]*)"):format(name))
+
+        return val and val:match(("%s=([^;]*)"):format(name)) or ""
     end
 end
 
