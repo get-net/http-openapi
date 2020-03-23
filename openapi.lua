@@ -12,7 +12,7 @@ local sprintf = string.format
     set variables for test cases beforehand
     kinda lazy-loading
 ]]
-local json, tap, log, uri
+local json, tap, uri
 
 local function read_spec(spec_path)
     assert(
@@ -829,7 +829,7 @@ function _T.set_manual_tests()
 end
 
 function _T.set_env(ctx)
-    log.info("RUNNING TESTS:\n")
+    print("RUNNING TESTS:\n")
 
     _T.test = tap.test("openapi-schema")
     local test_count = fun.reduce(
@@ -863,7 +863,7 @@ end
 
 function _T.run(ctx)
     -- set variables set before to respective modules
-    json, tap, log, uri = require("json"), require("tap"), require("log"), require("net.url")
+    json, tap, uri = require("json"), require("tap"), require("net.url")
 
     -- set local http-client instance just for testing purposes and nothing else
     _T.client = require("http.client").new({5})
@@ -882,7 +882,7 @@ function _T.run(ctx)
     local _ = _T.httpd_start(ctx)
 
     if fio.path.exists("tests/before.lua") then
-        log.info("\nRunning before script:\n")
+        print("\nRunning before script:\n")
         dofile("tests/before.lua")
     end
 
@@ -891,13 +891,31 @@ function _T.run(ctx)
     _T.run_user_tests()
 
     if fio.path.exists("tests/after.lua") then
-        log.info("\nRunning after script:\n")
+        print("\nRunning after script:\n")
         dofile("tests/after.lua")
     end
 
-    log.info("\nTesting complete. Shutting down...\n")
+    print("\nTesting complete. Shutting down...\n")
     _T.httpd_stop(ctx)
     os.exit(0)
+end
+
+function _T.encode_query(opts)
+    return fun.reduce(
+        function(res, key, val)
+            local str = ("%s=%s"):format(key, val)
+
+            if #res > 0 then
+                res = res .. ("&%s"):format(str)
+            else
+                res = str
+            end
+
+            return res
+        end,
+        "",
+        opts
+    )
 end
 
 -- decoding by response's content-type, maybe there'll be more of those later(xml or whatever)
@@ -921,8 +939,15 @@ function _T.form_request(method, relpath, query, body, opts)
     full_path.path = relpath
     full_path.query = uri.buildQuery(query)
 
-    body = method ~= "GET" and json.encode(body) or ""
-
+    if method ~= "GET" then
+        if opts.headers['content-type'] == 'application/x-www-form-urlencoded' then
+            body = _T.encode_query(body)
+        else
+            body = json.encode(body)
+        end
+    else
+        body = ""
+    end
 
     return {
         method,
@@ -1050,7 +1075,7 @@ end
 function _T.run_path_tests(ctx)
     _T.test_config      = require("tests.config")
 
-    log.info("\nRunning automatic tests:\n")
+    print("\nRunning automatic tests:\n")
 
     for path, options in next, ctx.openapi.paths do
         for method, opts in next, options do
@@ -1143,16 +1168,15 @@ function _T.run_path_tests(ctx)
 
                 _T.test:is_deeply(expected, resp_body, ("%s %s RESPONSE MATCH"):format(method, path))
             else
-                log.info("Skipping response match. REASON: no schema")
+                print("Skipping response match. REASON: no schema\n")
             end
-            log.info("\n")
         end
     end
 end
 
 function _T.run_user_tests()
     if _T.manual and next(_T.manual) then
-        log.info("Running user tests:\n")
+        print("Running user tests:\n")
 
         for _, val in next, _T.manual do
             if not val:match("test_before") then
