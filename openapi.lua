@@ -1170,6 +1170,7 @@ function _T.run_path_tests(ctx)
             else
                 print("Skipping response match. REASON: no schema\n")
             end
+            print("\n")
         end
     end
 end
