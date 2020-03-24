@@ -1,9 +1,12 @@
--- tnt imports
+-- tnt modules
 local base64_encode = require("digest").base64_encode
 local base64_decode = require("digest").base64_decode
 local uuid          = require("uuid")
 local fio           = require("fio")
 local fun           = require("fun")
+
+-- lua modules
+local neturl        = require("net.url")
 
 -- helpers
 local sprintf = string.format
@@ -43,17 +46,33 @@ local _T = {}
 local mt = {}
 
 function mt:__call(httpd, spec_path, options)
-    httpd.openapi = self:new(read_spec(spec_path))
-    local routes = httpd.openapi:parse_paths()
+    local openapi = self:new(read_spec(spec_path))
+
+    local server_settings = openapi:read_server()
+
+    if not server_settings.socket then
+        -- overrides server settings from openapi schema sets 8080 as a default port if not set
+        httpd = httpd.new(server_settings.host, server_settings.port or 8080, options.server_options)
+    else
+        local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
+            server_settings.socket
+        httpd = httpd.new("unix/", out_port, options.server_options)
+    end
+
+    httpd.openapi = openapi
+    httpd.openapi.server_settings = server_settings
+
+    local routes = openapi:parse_paths()
 
     for _, v in next, routes do
         httpd:route(v.options, v.controller)
     end
+
     httpd.options.handler = _U.handler
 
-    httpd.default                = _U.httpd_default_handler
-    httpd.error_handler          = _U.httpd_error_handler
-    httpd.security_error_handler = _U.httpd_security_error_handler
+    httpd.default                 = _U.httpd_default_handler
+    httpd.error_handler           = _U.httpd_error_handler
+    httpd.security_error_handler  = _U.httpd_security_error_handler
 
     _T.httpd_start = httpd.start
     _T.httpd_stop  = httpd.stop
@@ -71,6 +90,57 @@ setmetatable(_M, mt)
 
 function _M:new(spec)
     local obj = spec or {}
+
+    function self:read_server()
+        local config = require("config")
+
+        if not self.servers then
+            return {}
+        end
+
+        -- form server settings and unfold variables object
+        local current = fun.filter(
+            function(val)
+                if config.is_test then
+                    return val.description == "test"
+                end
+                return val.description == config.__name
+            end,
+            self.servers
+        ):map(
+            function(val)
+                if val.variables then
+                    for k, v in next, val.variables do
+                        val[k] = v.default
+                    end
+
+                    val.variables = nil
+                end
+
+                local parsed_url = neturl.parse(val.url)
+
+                if not val.basePath and parsed_url.path then
+                    val.basePath = parsed_url.path
+                end
+
+                if not val.port and parsed_url.port then
+                    val.port = parsed_url.port
+                end
+
+                val.host = parsed_url.host
+
+                return val
+            end
+        ):totable()
+
+        local _, settings = next(current)
+
+        if not settings then
+            error(("\nServer settings for %s are not set.\n"):format(config.__name))
+        end
+
+        return settings
+    end
 
     function self:parse_paths()
         local result = {}
@@ -100,12 +170,26 @@ function _M:new(spec)
 
                     local auth = opts.security and self:parse_security_schemes(opts.security) or nil
 
+                    local _path = self.parse_path(path)
+                    local path_settings = opts['x-settings'] or {}
+
+                    if self.server_settings then
+                        if self.server_settings.basePath and not path_settings.fullPath then
+
+                            _path = self.form_path(
+                                self.server_settings.basePath,
+                                _path
+                            )
+                        end
+                    end
+
                     table.insert(res, {
                         options = {
-                            method = method,
-                            path   = self.parse_path(path),
+                            settings     = opts['x-settings'],
+                            method       = method,
+                            path         = _path,
                             openapi_path = path,
-                            security = auth
+                            security     = auth
                         },
                         controller = controller
                     })
@@ -239,6 +323,17 @@ function _M:new(spec)
         end
 
         return true
+    end
+
+    function self.form_path(...)
+        local path = ("/%s"):format(table.concat({...}, "/"))
+        local res = path:gsub(
+            "//",
+            "/"
+        )
+
+        -- don't want to return the second value of gsub
+        return res
     end
 
     function self.parse_path(p)
@@ -844,19 +939,18 @@ function _T.set_env(ctx)
 
     _T.test:plan(test_count)
 
-    local server_settings = assert(ctx.openapi.servers)
-    server_settings = fun.filter(
-        function(val)
-            return val.description == "test"
-        end,
-        server_settings
-    ):totable()[1]
-
-    if not server_settings then
+    if not ctx.openapi.server_settings then
         error("Test server settings not set")
     end
 
-    _T.server_settings = uri.parse(server_settings.url)
+    --local server_settings = fun.filter(
+    --    function(val)
+    --        return val.description == "test"
+    --    end,
+    --    server_settings
+    --):totable()[1]
+
+    --_T.server_settings = uri.parse(server_settings.url)
     _T.set_manual_tests()
 
     return
@@ -871,10 +965,6 @@ function _T.run(ctx)
 
     -- sets the testing env
     _T.set_env(ctx)
-
-    -- overrides server settings from openapi schema
-    ctx.host = _T.server_settings.host
-    ctx.port = _T.server_settings.port
 
     -- shutdown request loggin to not get unwanted io data
     ctx.options.log_requests = false
@@ -1079,7 +1169,8 @@ function _T.run_path_tests(ctx)
 
     for path, options in next, ctx.openapi.paths do
         for method, opts in next, options do
-            if not opts['x-skip-test'] then
+            local settings = opts['x-settings'] or {}
+            if not settings.skipTest then
                 local headers = {}
                 local ctype
 
@@ -1158,7 +1249,7 @@ function _T.run_path_tests(ctx)
 
                 local resp = _T.send_request(request_data)
 
-                local exp_status = opts['x-expected-status']
+                local exp_status = settings.testStatus
 
                 _T.test:ok(resp.status == exp_status or 200, ("%s %s OK STATUS"):format(method, path))
 
