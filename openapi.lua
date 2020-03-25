@@ -120,7 +120,7 @@ function _M:new(spec)
                 local parsed_url = neturl.parse(val.url)
 
                 if not val.basePath and parsed_url.path then
-                    val.basePath = parsed_url.path
+                    val.basePath = #parsed_url.path > 0 and parsed_url.path or nil
                 end
 
                 if not val.port and parsed_url.port then
