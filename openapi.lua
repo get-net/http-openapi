@@ -156,6 +156,7 @@ function _M:new(spec)
             ):reduce(
                 function(res, opts)
                     opts.tags = opts.tags or {"default"}
+
                     -- gets the first tag from value
                     local _, tag = next(opts.tags)
                     local method = opts.method:upper()
@@ -950,7 +951,7 @@ function _T.set_env(ctx)
     --    server_settings
     --):totable()[1]
 
-    --_T.server_settings = uri.parse(server_settings.url)
+    _T.server_settings = ctx.openapi.server_settings
     _T.set_manual_tests()
 
     return
@@ -1026,9 +1027,12 @@ end
 
 function _T.form_request(method, relpath, query, body, opts)
     -- reuse already parsed and existing test server options
-    local full_path = table.deepcopy(_T.server_settings)
-    full_path.path = relpath
-    full_path.query = uri.buildQuery(query)
+    local parsed = neturl.parse(_T.server_settings.url)
+
+    parsed.path = relpath
+    parsed.port = _T.server_settings.port
+    parsed.path = parsed.path:gsub("//", "/")
+    parsed.query = uri.buildQuery(query)
 
     if method ~= "GET" then
         if opts.headers['content-type'] == 'application/x-www-form-urlencoded' then
@@ -1040,9 +1044,11 @@ function _T.form_request(method, relpath, query, body, opts)
         body = ""
     end
 
+    print(tostring(parsed))
+
     return {
         method,
-        tostring(full_path),
+        tostring(parsed),
         body,
         opts
     }
@@ -1242,26 +1248,33 @@ function _T.run_path_tests(ctx)
                     ):tomap()
                 end
 
+                local _path = path
+
+                if _T.server_settings.basePath and not settings.fullPath then
+                    _path = ctx.openapi.form_path(
+                        _T.server_settings.basePath,
+                        _path
+                    )
+                end
+
                 -- curl takes only uppercase method, responses with protocol error otherwise
                 method = method:upper()
 
-                local request_data = _T.form_request(method, path, query, body, {headers = headers})
+                local request_data = _T.form_request(method, _path, query, body, {headers = headers})
 
                 local resp = _T.send_request(request_data)
 
-                local exp_status = settings.testStatus
-
-                _T.test:ok(resp.status == exp_status or 200, ("%s %s OK STATUS"):format(method, path))
+                _T.test:ok(resp.status == settings.testStatus or 200, ("%s %s OK STATUS"):format(method, _path))
 
                 local resp_body = _T.json(resp)
                 local resp_schema = opts.responses[resp.status]
 
-                _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, path, resp.status))
+                _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, _path, resp.status))
 
                 if resp_schema then
                     local expected = _T.form_expected(ctx, resp_schema)
 
-                    _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, path))
+                    _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, _path))
                 else
                     print("Skipping response match. REASON: no schema\n")
                 end
