@@ -1,5 +1,5 @@
 package = "gtn-openapi"
-version = "1.0-1"
+version = "1.1-1"
 source = {
    url    = "git://github.com/get-net/http-openapi.git",
    branch = "development",
