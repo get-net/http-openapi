@@ -48,6 +48,31 @@ local mt = {}
 function mt:__call(httpd, spec_path, options)
     local openapi = self:new(read_spec(spec_path))
 
+    -- read config file
+    do
+        local env = arg[1] or "development"
+
+        if env:startswith("--") then
+            env = "development"
+        end
+
+        local status, conf = pcall(require, "config."..env)
+
+        assert(
+            status,
+            ("Invalid environment %q. Try adding it to the config directory"):format(env)
+        )
+        conf.__name  = env
+
+        _G.app_config = conf
+        _G.app_config.is_test = fun.any(
+            function(val)
+                return val == "--test"
+            end,
+            arg
+        )
+    end
+
     local server_settings = openapi:read_server()
 
     if not server_settings.socket then
@@ -92,8 +117,6 @@ function _M:new(spec)
     local obj = spec or {}
 
     function self:read_server()
-        local config = require("config")
-
         if not self.servers then
             return {}
         end
@@ -101,10 +124,10 @@ function _M:new(spec)
         -- form server settings and unfold variables object
         local current = fun.filter(
             function(val)
-                if config.is_test then
+                if app_config.is_test then
                     return val.description == "test"
                 end
-                return val.description == config.__name
+                return val.description == app_config.__name
             end,
             self.servers
         ):map(
@@ -136,7 +159,7 @@ function _M:new(spec)
         local _, settings = next(current)
 
         if not settings then
-            error(("\nServer settings for %s are not set.\n"):format(config.__name))
+            error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
         end
 
         return settings
@@ -1043,8 +1066,6 @@ function _T.form_request(method, relpath, query, body, opts)
     else
         body = ""
     end
-
-    print(tostring(parsed))
 
     return {
         method,
