@@ -9,7 +9,7 @@ local fun           = require("fun")
 local neturl        = require("net.url")
 
 -- helpers
-local sprintf = string.format
+local util   = require("gtn.util")
 
 --[[
     set variables for test cases beforehand
@@ -20,7 +20,7 @@ local json, tap, uri
 local function read_spec(spec_path)
     assert(
         fio.path.is_file(spec_path),
-        sprintf("Spec file %s does not exist", spec_path)
+        ("Spec file %s does not exist"):format(spec_path)
     )
 
     local tab = spec_path:split(".")
@@ -33,7 +33,7 @@ local function read_spec(spec_path)
     local status, res = pcall(decoder.decode, data)
     assert(
         status,
-        sprintf("Specification file %s is not valid", spec_path)
+        ("Specification file %s is not valid"):format(spec_path)
     )
 
     return res
@@ -48,44 +48,23 @@ local mt = {}
 function mt:__call(httpd, spec_path, options)
     local openapi = self:new(read_spec(spec_path))
 
-    -- read config file
-    do
-        local env = arg[1] or "development"
-
-        if env:startswith("--") then
-            env = "development"
-        end
-
-        local status, conf = pcall(require, "config."..env)
-
-        assert(
-            status,
-            ("Invalid environment %q. Try adding it to the config directory"):format(env)
-        )
-        conf.__name  = env
-
-        _G.app_config = conf
-        _G.app_config.is_test = fun.any(
-            function(val)
-                return val == "--test"
-            end,
-            arg
-        )
+    if not app_config then
+        util.read_config()
     end
 
     local server_settings = openapi:read_server()
 
     if not server_settings.socket then
         -- overrides server settings from openapi schema sets 8080 as a default port if not set
-        httpd = httpd.new(server_settings.host, server_settings.port or 8080, options.server_options)
+        httpd = httpd.new(server_settings.host, server_settings.port or 8080, app_config.server_options)
     else
         local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
             server_settings.socket
-        httpd = httpd.new("unix/", out_port, options.server_options)
+        httpd = httpd.new("unix/", out_port, app_config.server_options)
     end
 
     httpd.openapi = openapi
-    httpd.openapi.server_settings = server_settings
+    httpd.openapi.server_settings = server_settings or {}
 
     local routes = openapi:parse_paths()
 
@@ -132,27 +111,48 @@ function _M:new(spec)
             self.servers
         ):map(
             function(val)
+                local server_params = util.read_path_parameters(val.url)
+
+                if next(server_params) and not val.variables then
+                    error(("Server variables are not set for %q environment: %s"):format(app_config.__name, val.url))
+                end
+
+                local parsed_url
                 if val.variables then
-                    for k, v in next, val.variables do
-                        val[k] = v.default
+                    val.variables = fun.map(
+                        function(k, v)
+                            return k, v.default
+                        end,
+                        val.variables
+                    ):tomap()
+
+                    for _, param in next, server_params do
+                        local pattern = ("{%s}"):format(param)
+                        local value = assert(
+                            val.variables[param],
+                            ("Variable %q is not set for %s server options"):format(param, app_config.__name)
+                        )
+
+                        value = value:strip("/")
+
+                        val.url = val.url:gsub(pattern, value)
                     end
 
-                    val.variables = nil
+                    parsed_url = neturl.parse(val.url)
+
+                    parsed_url = fun.reduce(
+                        function(r, k, v)
+                            r[k] = v
+                            return r
+                        end,
+                        parsed_url,
+                        val.variables
+                    )
+                else
+                    parsed_url = neturl.parse(val.url)
                 end
 
-                local parsed_url = neturl.parse(val.url)
-
-                if not val.basePath and parsed_url.path then
-                    val.basePath = #parsed_url.path > 0 and parsed_url.path or nil
-                end
-
-                if not val.port and parsed_url.port then
-                    val.port = parsed_url.port
-                end
-
-                val.host = parsed_url.host
-
-                return val
+                return parsed_url
             end
         ):totable()
 
@@ -189,29 +189,21 @@ function _M:new(spec)
 
                     local controller = tag
                     if opts.operationId then
-                        controller = sprintf("%s#%s", tag, opts.operationId)
+                        controller = ("%s#%s"):format(tag, opts.operationId)
                     end
 
                     local auth = opts.security and self:parse_security_schemes(opts.security) or nil
 
-                    local _path = self.parse_path(path)
-                    local path_settings = opts['x-settings'] or {}
-
-                    if self.server_settings then
-                        if self.server_settings.basePath and not path_settings.fullPath then
-
-                            _path = self.form_path(
-                                self.server_settings.basePath,
-                                _path
-                            )
-                        end
-                    end
+                    local _path = self:form_path(
+                        path,
+                        method
+                    )
 
                     table.insert(res, {
                         options = {
                             settings     = opts['x-settings'],
                             method       = method,
-                            path         = _path,
+                            path         = util.parse_path(_path),
                             openapi_path = path,
                             security     = auth
                         },
@@ -237,10 +229,9 @@ function _M:new(spec)
         if self.components.securitySchemes then
             options = self.components.securitySchemes[key]
             if not options then
-                error(sprintf(
-                    "Schema %s is not described in securitySchemes",
-                    key
-                ))
+                error(
+                    ("Schema %s is not described in securitySchemes"):format(key)
+                )
             end
         end
         return {
@@ -256,7 +247,7 @@ function _M:new(spec)
         end
 
         if not self.paths[path][method] then
-            return false, sprintf("%s method is not supported", method:upper())
+            return false, ("%s method is not supported"):format(method:upper())
         end
 
         local options = self.paths[path][method]
@@ -271,7 +262,7 @@ function _M:new(spec)
             end
 
             if not options.requestBody.content[ctype] then
-                return false, sprintf("Content-type %s is not supported", ctype)
+                return false, ("Content-type %s is not supported"):format(ctype)
             end
         end
 
@@ -279,12 +270,15 @@ function _M:new(spec)
     end
 
     function self:form_params(path, method, ctype)
-        local body = {}
-        if method == "post" and ctype then
-            body = self.paths[path][method].requestBody
+        local opts = self.paths[path]
+
+        if not opts then
+            error(("Path options not found: %s"):format(path))
         end
 
-        local query = self.paths[path][method].parameters
+        local body = opts[method].requestBody
+
+        local query = opts[method].parameters
 
         local result = {
             query = query or {}
@@ -329,7 +323,7 @@ function _M:new(spec)
 
                 if not field then
                     error(
-                        sprintf("Field %s was not found in reference %s", v, str)
+                        ("Field %s was not found in reference %s"):format(v, str)
                     )
                 end
                 return field
@@ -349,24 +343,52 @@ function _M:new(spec)
         return true
     end
 
-    function self.form_path(...)
-        local path = ("/%s"):format(table.concat({...}, "/"))
-        local res = path:gsub(
-            "//",
-            "/"
-        )
+    function self:form_path(relpath, method)
+        method = method:lower()
+        local opts = self.paths[relpath]
 
-        -- don't want to return the second value of gsub
-        return res
+        if not opts then
+            error(("options for %s not found"):format(relpath))
+        end
+
+        local settings = opts[method]['x-settings'] or {}
+
+        if self.server_settings.path and not settings.fullPath then
+            local res = self.join_path(self.server_settings.path, unpack(relpath:split("/")))
+            return res
+        end
+
+        return relpath
     end
 
-    function self.parse_path(p)
-        local res = p
-        for path_param in p:gmatch("{(%w+)}") do
-            local sub = sprintf("{%s}", path_param)
-            res = res:gsub(sub, ":"..path_param)
+    function self.join_path(base, ...)
+        if not type(base) == "string" then
+            error("First argument must be a string")
         end
-        return res
+
+        local parsed = neturl.parse(base)
+
+        parsed.path = fun.reduce(
+            function(res, val)
+                if #val > 0 then
+                    if not res:endswith("/") and not val:startswith("/") then
+                        res = res.."/"
+                    end
+
+                    if res:endswith("/") and val:startswith("/") then
+                        val = val:sub(2, #val)
+                    end
+
+                    res = res .. val
+                end
+
+                return res
+            end,
+            parsed.path,
+            {...}
+        )
+
+        return tostring(parsed:normalize())
     end
 
     setmetatable(obj, self)
@@ -1050,12 +1072,12 @@ end
 
 function _T.form_request(method, relpath, query, body, opts)
     -- reuse already parsed and existing test server options
-    local parsed = neturl.parse(_T.server_settings.url)
+    local settings = table.deepcopy(_T.server_settings)
 
-    parsed.path = relpath
-    parsed.port = _T.server_settings.port
-    parsed.path = parsed.path:gsub("//", "/")
-    parsed.query = uri.buildQuery(query)
+    settings.path = relpath
+    settings.port = _T.server_settings.port
+    settings.path = settings.path:gsub("//", "/")
+    settings.query = uri.buildQuery(query)
 
     if method ~= "GET" then
         if opts.headers['content-type'] == 'application/x-www-form-urlencoded' then
@@ -1069,7 +1091,7 @@ function _T.form_request(method, relpath, query, body, opts)
 
     return {
         method,
-        tostring(parsed),
+        tostring(settings),
         body,
         opts
     }
@@ -1223,7 +1245,12 @@ function _T.run_path_tests(ctx)
                     rawset(headers, "content-type", ctype)
                 end
 
-                local params = ctx.openapi:form_params(path, method, ctype)
+                local _path = ctx.openapi:form_path(
+                    path,
+                    method
+                )
+
+                local params = ctx.openapi:form_params(path, method, ctype, _path)
 
                 local body, query = {}, {}
 
@@ -1237,7 +1264,7 @@ function _T.run_path_tests(ctx)
                                  throw an error otherwise
                             ]]
                             if fun.any(function(val) return val == name end,params.body.required) then
-                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, path)
+                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, _path)
                                 assert(vars.example, msg)
                             end
                             return name, vars.example
@@ -1249,10 +1276,10 @@ function _T.run_path_tests(ctx)
                 if params.query then
                     query = fun.map(
                         function(vars)
-                            local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, path)
+                            local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, _path)
                             assert(vars.schema, schema_msg)
                             if vars.required or vars['in'] == "path" then
-                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(vars.name, method, path)
+                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(vars.name, method, _path)
                                 assert(vars.schema.example, msg)
                             end
 
@@ -1260,22 +1287,13 @@ function _T.run_path_tests(ctx)
                                 return vars.name, vars.schema.example
                             else
                                 local pattern = ("{%s}"):format(vars.name)
-                                path = path:gsub(pattern, vars.schema.example)
+                                _path = _path:gsub(pattern, vars.schema.example)
                             end
 
                             return vars,name
                         end,
                         params.query
                     ):tomap()
-                end
-
-                local _path = path
-
-                if _T.server_settings.basePath and not settings.fullPath then
-                    _path = ctx.openapi.form_path(
-                        _T.server_settings.basePath,
-                        _path
-                    )
                 end
 
                 -- curl takes only uppercase method, responses with protocol error otherwise

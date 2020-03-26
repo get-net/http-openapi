@@ -2,8 +2,8 @@ package = "gtn-openapi"
 version = "1.0-1"
 source = {
    url    = "git://github.com/get-net/http-openapi.git",
-   branch = "master",
-   tag    = "master"
+   branch = "development",
+   tag    = "development"
 }
 description = {
    summary  = "Tarantool http-server OpenAPI support wrapper",
@@ -19,6 +19,7 @@ build = {
 
    modules = {
       ['gtn.cors'] = "cors.lua",
-      ['gtn.openapi'] = "openapi.lua"
+      ['gtn.openapi'] = "openapi.lua",
+      ['gtn.utils'] = "utils.lua"
    }
 }
