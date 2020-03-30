@@ -20,6 +20,6 @@ build = {
    modules = {
       ['gtn.cors'] = "cors.lua",
       ['gtn.openapi'] = "openapi.lua",
-      ['gtn.utils'] = "utils.lua"
+      ['gtn.util'] = "util.lua"
    }
 }
