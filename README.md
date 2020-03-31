@@ -3,18 +3,22 @@
  
  #### Quickstart
  ```lua
- local server  = require("http.server").new(nil, 5000)
- local openapi = require("gtn.openapi")
- 
- local httpd = openapi(server, 'api.yaml', {
-     security = require("authorization")
- })
- 
- httpd:start()
+local openapi = require("gtn.openapi")
+
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml", 
+    {
+        security = require("authorization")
+    }
+)
+
+app:start()
  ```
- As you can see, openapi call takes three positional arguments, which are:
- server instance, path to read specification from and also a table with
- options(only takes security for now).
+ As you can see, openapi call takes four positional arguments, which are:
+ server module, router module, path to read specification from and also a table with
+ options.
  
  
  #### Routing
@@ -61,20 +65,24 @@
  in your spec-file, or a function if you don't have multiple authorization protocols.
  
  api.yaml
- ```yaml
- components:
-   securitySchemes:
-     bearerAuth:
-       type: http
-       scheme: bearer
-     apiKeyAuth:
-       type: apiKey
-       in: header
-       name: X-API-KEY
-     basicAuth:
-       type: http
-       scheme: basic
- ```
+```yaml
+components:
+securitySchemes:
+  bearerAuth:
+     type: http
+     scheme: bearer
+  apiKeyAuth:
+     type: apiKey
+     in: header
+     name: X-API-KEY
+  basicAuth:
+     type: http
+     scheme: basic
+  cookieAuth:
+     type: apiKey
+     in: cookie
+     name: cookiename
+```
  
  authorization.lua file
  ```lua
@@ -94,7 +102,12 @@
      -- validate user credentials
      return result, err
  end
- 
+
+ function _M.cookieAuth(url, scopes, cookie)
+     -- validate cookie here
+     return result, err
+ end
+
  return _M
  ```
  The module correlate those automatically by the name of security scheme and method.
@@ -111,7 +124,6 @@
    summary: 'Example request'
    security:
      - bearerAuth: ['test_scope', 'example_scope', 'etc_scope'] #here they are
-   ...
  ```
  As for token, api_key and username\password pair: those are, obviously, your authorization data,
  that needs to be checked in order to proceed with the request handling process.
@@ -135,17 +147,21 @@
  You may also override default error handling with a function:
  
  ```lua
- local server  = require("http.server").new(nil, 5000)
- local openapi = require("gtn.openapi")
+local openapi = require("gtn.openapi")
+
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml", 
+    {
+        security = require("authorization")
+    }
+)
  
- local httpd = openapi(server, 'api.yaml', {
-     security = require("authorization")
- })
- 
- -- the default return value
- -- ctx is a context value, that is a request object here
- httpd:default(
-     function(ctx, err)
+-- the default return value
+-- ctx is a context value, that is a request object here
+app:default(
+    function(ctx, err)
          return ctx:render({
              status = 204,
              json = {
@@ -154,12 +170,12 @@
                  error   = "No Content"
              }
          })
-     end
- )
+    end
+)
  
- -- this will catch all request validation exceptions, etc. 
- httpd:error_handler(
-     function(ctx, err)
+-- this will catch all request validation exceptions, etc. 
+app:error_handler(
+    function(ctx, err)
          -- err argument here will be a table most of the time
          return ctx:render({
              json = {
@@ -167,12 +183,12 @@
                  errors  = err    
              }   
          })
-     end
- )
+    end
+)
  
- -- the second return value of our `bearerAuth`, `apiKeyAuth` and `basicAuth` functions will be here
- httpd:security_error_handler(
-     function(ctx, err)
+-- the second return value of our `bearerAuth`, `apiKeyAuth` and `basicAuth` functions will be here
+app:security_error_handler(
+    function(ctx, err)
          return ctx:render({
              status = 401,
              json = {
@@ -181,43 +197,55 @@
                  message = err
              }   
          })
-     end
- )
- ```
+    end
+)
+```
 
 ## CORS handling
-Module cors is a wrapper that takes current server instance as the first argument and
-`allow` options as the second. The second argument is optional, and if it's not set then
-the default options take it's place.
+You may set cors handling by setting the **cors** option to your openapi instance initialization
 
 #### Example
 ```lua
-local httpd = require("http.server").new(nil, 5000)
-local cors  = require("gtn.cors")
+local openapi = require("gtn.openapi")
 
--- this call returns nothing, just maps some methods
-cors(httpd, {
-    max_age = 18400, -- default value 3600
-    allow_credentials = false, -- default value true
-    allow_headers = {"Authorization", "Content-Type", "X-Requested-With"}, -- default {"Authorization", "Content-Type"} 
-    allow_origin = {"http://example.com"} -- default {"*"}
-})
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml", 
+    {
+        security = require("authorization"),
+        cors     = {
+            -- default value 3600
+            max_age = 18400,
+            -- default value true
+            allow_credentials = false,
+            -- default {"Authorization", "Content-Type"}
+            allow_headers = {"Authorization", "Content-Type", "X-Requested-With"},
+            -- default {"*"} 
+            allow_origin = {"http://example.com"}
+        }
+    }
+)
 
-httpd:route({path="/api/user", method="GET"}, some_handler)
+app:route({path="/api/user", method="GET"}, some_handler)
 
-httpd:start()
+app:start()
 ```
  
- You can also wrap openapi return value inside the cors call:
+ To set default CORS settings:
  ```lua
- local server  = require("http.server").new(nil, 5000)
  local openapi = require("gtn.openapi")
- 
- local httpd = openapi(server, 'api.yaml', {
-     security = require("authorization")
- })
- 
- cors(httpd)
+
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml", 
+    {
+        security = require("authorization"),
+        cors     = {} -- takes only a table value
+    }
+)
+app:start()
  ```
- 
+
  The default CORS options should suffice for the development process.
