@@ -45,4 +45,29 @@ function _M.parse_path(p)
     return res
 end
 
+-- basic responses
+function _M.not_implemented(self, tag, operation_id)
+    return self:render({
+        status = 501,
+        json = {
+            error       = "Not Implemented",
+            tag         = tag,
+            operationId = operation_id
+        }
+    })
+end
+
+function _M.bad_request(self)
+    return self:render({
+        status = 400,
+        json = {
+            error = "Bad Request"
+        }
+    })
+end
+
+function _M.cors_response(ctx)
+
+end
+
 return _M

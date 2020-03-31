@@ -1,6 +1,7 @@
 -- tnt modules
 local base64_encode = require("digest").base64_encode
 local base64_decode = require("digest").base64_decode
+local tsgi          = require("http.tsgi")
 local uuid          = require("uuid")
 local fio           = require("fio")
 local fun           = require("fun")
@@ -9,13 +10,20 @@ local fun           = require("fun")
 local neturl        = require("net.url")
 
 -- helpers
-local util   = require("gtn.util")
+local util          = require("gtn.util")
 
 --[[
     set variables for test cases beforehand
     kinda lazy-loading
 ]]
 local json, tap, uri
+
+--local default_cors = {
+--    max_age = 3600,
+--    allow_credentials = true,
+--    allow_headers = {"Authorization, Content-Type"},
+--    allow_origin = {"*"}
+--}
 
 local function read_spec(spec_path)
     assert(
@@ -45,7 +53,7 @@ local _U = {}
 local _T = {}
 local mt = {}
 
-function mt:__call(httpd, spec_path, options)
+function mt:__call(httpd, router, spec_path, options)
     local openapi = self:new(read_spec(spec_path))
 
     if not app_config then
@@ -68,11 +76,63 @@ function mt:__call(httpd, spec_path, options)
 
     local routes = openapi:parse_paths()
 
-    for _, v in next, routes do
-        httpd:route(v.options, v.controller)
+    router = router.new(app_config.server)
+
+    httpd:set_router(router)
+
+    for k, v in next, options do
+        --if k == "cors" then
+        --    assert(type(v) == "table", "CORS option must be a table")
+        --    for key, val in next, v do
+        --        if not default_cors[key] then
+        --            error(("Unsupported CORS option %s"):format(key))
+        --        end
+        --
+        --        if type(val) ~= type(default_cors[key]) then
+        --            local msg = ("Invalid type for option %s. Expected %s got %s"):format(
+        --                k,
+        --                type(default_cors[key]),
+        --                type(v)
+        --            )
+        --            error(msg)
+        --        end
+        --    end
+        --
+        --    if not next(v) then
+        --        v = default_cors
+        --    end
+        --end
+        rawset(httpd.options, k, v)
     end
 
-    httpd.options.handler = _U.handler
+    for _, v in next, routes do
+        if v.options.security then
+            router:use(
+                _U.bind_security,
+                {
+                    preroute = true,
+                    name     = "authenticate#"..v.controller,
+                    method   = v.options.method,
+                    path     = v.options.path
+                }
+            )
+        end
+
+        router:use(
+            httpd.openapi.validate_params,
+            {
+                preroute = true,
+                name     = "validate#"..v.controller,
+                method   = v.options.method,
+                path     = v.options.path
+            }
+        )
+        router:route(v.options, v.controller)
+    end
+
+    if httpd.options.cors then
+
+    end
 
     httpd.default                 = _U.httpd_default_handler
     httpd.error_handler           = _U.httpd_error_handler
@@ -82,10 +142,6 @@ function mt:__call(httpd, spec_path, options)
     _T.httpd_stop  = httpd.stop
 
     httpd.start = _T.start
-
-    for k, v in next, options do
-        rawset(httpd.options, k, v)
-    end
 
     return httpd
 end
@@ -334,13 +390,24 @@ function _M:new(spec)
     end
 
     function self.validate_params(ctx)
+        local self = ctx:router()
+
+        local r = self:match(ctx:method(), ctx:path())
+        ctx.endpoint = r.endpoint
+        ctx.stash    = r.stash
+
+        _U.render(ctx)
+        _U.handler(ctx)
+
         local errors = _V.validate(ctx)
 
         if next(errors) then
-            return nil, errors
+            local httpd = ctx['tarantool.http.httpd']
+
+            return httpd.error_handler(ctx, errors)
         end
 
-        return true
+        return tsgi.next(ctx)
     end
 
     function self:form_path(relpath, method)
@@ -399,23 +466,23 @@ end
 
 -- utility functions
 function _U.bearer(ctx)
-    local header = ctx.req.headers.authorization
+    local header = ctx:headers().authorization
 
     if not header then
         return
     end
 
-    return header:match("Bearer (%w+)")
+    return header:match("Bearer (.*)")
 end
 
 function _U.basic(ctx)
-    local header = ctx.req.headers.authorization
+    local header = ctx:headers().authorization
 
     if not header then
         return
     end
 
-    local creds = base64_decode(header:match("Basic (%w+)"))
+    local creds = base64_decode(header:match("Basic (.*)"))
     if not creds then
         return
     end
@@ -423,156 +490,112 @@ function _U.basic(ctx)
 end
 
 function _U.apiKey(ctx, name, goes_in)
+    local headers = ctx:headers()
+
     if goes_in == "header" then
-        return ctx.req.headers[name:lower()]
+        return headers[name:lower()]
     elseif goes_in == "cookie" then
-        local val = ctx.req.headers["cookie"]
+        local val = headers["cookie"]
 
         return val and val:match(("%s=([^;]*)"):format(name)) or ""
     end
 end
 
-local function not_implemented(self, tag, operationId)
-    return self:render({
-        status = 501,
-        json = {
-            error       = "Not Implemented",
-            tag         = tag,
-            operationId = operationId
-        }
-    })
+-- overrides response render handling
+function _U.render(ctx)
+    local render_func = ctx.render
+    ctx.render = function(ctx, input)
+        local resp = render_func(ctx, input)
+
+        resp.status = input.status
+        if input.headers then
+            for k, v in next, input.headers do
+                resp.headers[k] = v
+            end
+        end
+
+        return resp
+    end
 end
 
-local function bad_request(self)
-    return self:render({
-        status = 400,
-        json = {
-            error = "Bad Request"
-        }
-    })
+-- overrides route handler with this one
+function _U.handler(ctx)
+    local handler_func = ctx.endpoint.handler
+
+    ctx.endpoint.handler = function(ctx)
+        local status, resp = pcall(handler_func, ctx)
+
+        local httpd = ctx['tarantool.http.httpd']
+
+        if not status then
+            local tag, op_id
+            for _, val in next, _U.ni_patterns do
+                tag, op_id = resp:match(val)
+
+                if tag ~= nil then
+                    break
+                end
+            end
+
+            if tag or op_id then
+                return util.not_implemented(ctx, tag, op_id)
+            end
+
+            return httpd.error_handler(ctx, resp)
+        end
+        if not resp then
+            return httpd.default(ctx, "No Content")
+        end
+
+        return resp
+    end
 end
 
 function _U.bind_security(ctx)
-    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and ctx.httpd.openapi.global_security)
+    local self = ctx:router()
+
+    local r = self:match(ctx:method(), ctx:path())
+    ctx.endpoint = r.endpoint
+    ctx.stash    = r.stash
+
+    local httpd = ctx['tarantool.http.httpd']
+
+    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and httpd.openapi.global_security)
 
     if security ~= nil then
         local auth_handler
-        if not ctx.httpd.options.security then
-            return nil, "Security options are not specified for this server instance"
+        if not httpd.options.security then
+            local resp = tsgi.next(ctx)
+            return httpd.default(resp, "Security options are not specified for this server instance")
         end
 
-        if type(ctx.httpd.options.security) == "table" then
-            auth_handler = ctx.httpd.options.security[security.name]
+        if type(httpd.options.security) == "table" then
+            auth_handler = httpd.options.security[security.name]
         else
-            auth_handler = ctx.httpd.options.security
+            auth_handler = httpd.options.security
         end
 
         if auth_handler then
             local scheme = security.options.scheme or security.options.type
             local auth_data, additional = _U[scheme](ctx, security.options.name, security.options['in'])
             if not auth_data then
-                return nil, "Authorization data not found"
+                return httpd.security_error_handler(ctx, "Authorization data not found")
             else
                 local err
-                ctx.authorization, err = auth_handler(ctx.req.path,  security.scope, auth_data, additional)
+                ctx.authorization, err = auth_handler(ctx.path,  security.scope, auth_data, additional)
 
                 if err then
-                    return nil, err
+                    --local resp = tsgi.next(ctx)
+                    return httpd.security_error_handler(ctx, err)
                 end
             end
         else
-            return nil, "Security handler is not implemented"
+            local resp = tsgi.next(ctx)
+            return httpd.security_error_handler(resp, "Security handler is not implemented")
         end
     end
 
-    return
-end
-
--- tweaked request handler
-function _U.handler(self, ctx)
-    local format = 'html'
-    local pformat = string.match(ctx.req.path, '[.]([^.]+)$')
-
-    if pformat ~= nil then
-        format = pformat
-    end
-
-    local r = self:match(ctx.req.method, ctx.req.path)
-
-    if r == nil then
-        bad_request(ctx)
-
-        return ctx.res
-    else
-        r.stash.format = format
-
-        ctx.endpoint = r.endpoint
-        ctx.tstash   = r.stash
-    end
-
-    ctx.headers = ctx.headers or {}
-
-    local _, s_err = _U.bind_security(ctx)
-    if s_err then
-        local msg = self.security_error_handler(ctx, s_err)
-        if ctx.res then
-            return ctx.res
-        end
-        return msg
-    end
-
-    if ctx.endpoint.openapi_path then
-        _, errors = ctx.httpd.openapi.validate_params(ctx)
-
-        if errors then
-            local msg = self.error_handler(ctx, errors)
-
-            if ctx.res then
-                return ctx.res
-            end
-
-            return msg
-        end
-    end
-
-    if self.hooks.before_dispatch ~= nil then
-        local _ = self.hooks.before_dispatch(ctx)
-
-        if ctx.res then
-            return ctx.res
-        end
-    end
-
-    local status, err = pcall(r.endpoint.sub, ctx)
-
-    if not status then
-        local tag, op_id
-        for _, val in next, _U.ni_patterns do
-            tag, op_id = err:match(val)
-
-            if tag ~= nil then
-                break
-            end
-        end
-
-        if tag or op_id then
-            not_implemented(ctx, tag, op_id)
-        else
-            self.error_handler(ctx, err)
-        end
-
-        return ctx.res
-    end
-
-    if self.hooks.after_dispatch ~= nil then
-        self.hooks.after_dispatch(ctx)
-    end
-
-    if not ctx.res then
-        self.default(ctx, "No Content")
-    end
-
-    return ctx.res
+    return tsgi.next(ctx)
 end
 
 function _U.httpd_default_handler(self, f)
@@ -614,18 +637,20 @@ function _U.httpd_security_error_handler(self, f)
 end
 
 _U.ni_patterns = {
-    [[Can't load module "(.*)": "(.*)"]],
-    [[Controller "(.*)" doesn't contain function "(.*)"]],
-    [[require "(.*)" didn't return table]],
-    [[Controller "(.*)" is not a function]]
+    [[Can't load module '(.*)': '(.*)']],
+    [[Controller '(.*)' doesn't contain function '(.*)']],
+    [[require '(.*)' didn't return table]],
+    [[Controller '(.*)' is not a function]]
 }
 
 
 -- validation functions
 function _V.validate(ctx)
     local c, a = ctx.endpoint.controller, ctx.endpoint.action
-    local ctype = ctx.req.headers['content-type']
-    local req_path, method = ctx.endpoint.openapi_path, ctx.req.method:lower()
+    local headers = ctx:headers()
+
+    local ctype = headers['content-type']
+    local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
 
     if not req_path then
         return
@@ -639,7 +664,9 @@ function _V.validate(ctx)
         end
     end
 
-    local has, err = ctx.httpd.openapi:has_params(req_path, method, ctype)
+    local httpd = ctx['tarantool.http.httpd']
+
+    local has, err = httpd.openapi:has_params(req_path, method, ctype)
 
     if err then
         return {err}
@@ -649,39 +676,41 @@ function _V.validate(ctx)
         return {}
     end
 
-    if not ctx.httpd.cache.params then
-        ctx.httpd.cache.params = {}
+    httpd.cache = httpd.cache or {}
+
+    if not httpd.cache.params then
+        httpd.cache.params = {}
     end
 
-    local cache = ctx.httpd.cache.params[c]
+    local cache = httpd.cache.params[c]
 
     if not cache then
-        ctx.httpd.cache.params[c] = {}
+        httpd.cache.params[c] = {}
     end
 
-    cache = not a and cache or ctx.httpd.cache.params[c][a]
+    cache = not a and cache or httpd.cache.params[c][a]
 
     if not cache then
         if a then
-            ctx.httpd.cache.params[c][a] = {}
-            cache = ctx.httpd.cache.params[c][a]
+            httpd.cache.params[c][a] = {}
+            cache = httpd.cache.params[c][a]
         else
-            ctx.httpd.cache.params[c] = {}
-            cache = ctx.httpd.cache.params[c]
+            httpd.cache.params[c] = {}
+            cache = httpd.cache.params[c]
         end
     end
 
     if not next(cache) then
-        local params, p_err = ctx.httpd.openapi:form_params(req_path, method, ctype)
+        local params, p_err = httpd.openapi:form_params(req_path, method, ctype)
 
         if p_err then
             error(p_err)
         end
 
         if action then
-            ctx.httpd.cache.params[c][a] = params
+            httpd.cache.params[c][a] = params
         else
-            ctx.httpd.cache.params[c] = params
+            httpd.cache.params[c] = params
         end
         cache = params
     end
