@@ -18,12 +18,12 @@ local util          = require("gtn.util")
 ]]
 local json, tap, uri
 
---local default_cors = {
---    max_age = 3600,
---    allow_credentials = true,
---    allow_headers = {"Authorization, Content-Type"},
---    allow_origin = {"*"}
---}
+local default_cors = {
+    max_age = 3600,
+    allow_credentials = true,
+    allow_headers = {"Authorization, Content-Type"},
+    allow_origin = {"*"}
+}
 
 local function read_spec(spec_path)
     assert(
@@ -81,27 +81,28 @@ function mt:__call(httpd, router, spec_path, options)
     httpd:set_router(router)
 
     for k, v in next, options do
-        --if k == "cors" then
-        --    assert(type(v) == "table", "CORS option must be a table")
-        --    for key, val in next, v do
-        --        if not default_cors[key] then
-        --            error(("Unsupported CORS option %s"):format(key))
-        --        end
-        --
-        --        if type(val) ~= type(default_cors[key]) then
-        --            local msg = ("Invalid type for option %s. Expected %s got %s"):format(
-        --                k,
-        --                type(default_cors[key]),
-        --                type(v)
-        --            )
-        --            error(msg)
-        --        end
-        --    end
-        --
-        --    if not next(v) then
-        --        v = default_cors
-        --    end
-        --end
+        if k == "cors" then
+            assert(type(v) == "table", "CORS option must be a table")
+            local _cors = default_cors
+
+            for key, val in next, v do
+                if not default_cors[key] then
+                    error(("Unsupported CORS option %s"):format(key))
+                end
+
+                if type(val) ~= type(default_cors[key]) then
+                    local msg = ("Invalid type for option %s. Expected %s got %s"):format(
+                        k,
+                        type(default_cors[key]),
+                        type(v)
+                    )
+                    error(msg)
+                end
+                rawset(_cors, key, val)
+            end
+
+            v = _cors
+        end
         rawset(httpd.options, k, v)
     end
 
@@ -127,11 +128,20 @@ function mt:__call(httpd, router, spec_path, options)
                 path     = v.options.path
             }
         )
+
+        if httpd.options.cors then
+            router:use(
+                _U.handle_cors,
+                {
+                    preroute = true,
+                    name     = "cors#"..v.controller,
+                    method   = "ANY",
+                    path     = v.options.path
+                }
+            )
+        end
+
         router:route(v.options, v.controller)
-    end
-
-    if httpd.options.cors then
-
     end
 
     httpd.default                 = _U.httpd_default_handler
@@ -396,8 +406,13 @@ function _M:new(spec)
         ctx.endpoint = r.endpoint
         ctx.stash    = r.stash
 
-        _U.render(ctx)
-        _U.handler(ctx)
+        if not ctx.render_swap then
+            _U.render(ctx)
+        end
+
+        if not ctx.handler_swap then
+            _U.handler(ctx)
+        end
 
         local errors = _V.validate(ctx)
 
@@ -508,6 +523,13 @@ function _U.render(ctx)
         local resp = render_func(ctx, input)
 
         resp.status = input.status
+
+        if ctx.hdrs then
+            for k, v in next, ctx.hdrs do
+                resp.headers[k] = v
+            end
+        end
+
         if input.headers then
             for k, v in next, input.headers do
                 resp.headers[k] = v
@@ -516,6 +538,7 @@ function _U.render(ctx)
 
         return resp
     end
+    ctx.render_swap = true
 end
 
 -- overrides route handler with this one
@@ -549,6 +572,87 @@ function _U.handler(ctx)
 
         return resp
     end
+    ctx.handler_swap = true
+end
+
+function _U.handle_cors(ctx)
+    local httpd = ctx['tarantool.http.httpd']
+    local router = ctx:router()
+
+    if not ctx.render_swap then
+        _U.render(ctx)
+    end
+
+    ctx.hdrs = {}
+
+    local req_method = ctx:headers()['access-control-request-method'] or ctx:method()
+    local req_headers = ctx:headers()['access-control-request-headers']
+
+    if req_headers then
+        req_headers = req_headers:split(",")
+    end
+
+    local route = router:match(req_method, ctx:path())
+
+    if not route then
+        if ctx:method() == "OPTIONS" then
+            return ctx:render({
+                status = 201,
+                text = ""
+            })
+        end
+        return util.bad_request(ctx)
+    end
+
+    ctx.endpoint = route.endpoint
+    ctx.stash    = route.stash
+
+    if not ctx.handler_swap then
+        _U.handler(ctx)
+    end
+
+    if fun.any(function(v) return v=="*" end, httpd.options.cors.allow_origin) then
+        ctx.hdrs["access-control-allow-origin"] = "*"
+    else
+        if fun.any(function(v) return v==ctx:headers()["origin"] end, httpd.options.cors.allow_origin) then
+            ctx.hdrs["access-control-allow-origin"] = ctx:headers()["origin"]
+        end
+    end
+
+    ctx.hdrs['access-control-max-age'] = httpd.options.cors.max_age
+    ctx.hdrs['access-control-allow-credentials'] = tostring(httpd.options.cors.allow_credentials)
+    ctx.hdrs['access-control-allow-headers'] = table.concat(httpd.options.cors.allow_headers, ",")
+
+    if ctx:method() == 'OPTIONS' then
+        local methods
+        if httpd.openapi then
+            local path = httpd.openapi.paths[ctx.endpoint.openapi_path]
+
+            if not path then
+                return
+            end
+
+            methods = fun.map(
+                function(k)
+                    return k:upper()
+                end,
+                path
+            ):totable()
+        else
+            methods = {ctx.endpoint.method}
+        end
+
+        if fun.any(function(val) return val == req_method end, methods) then
+            ctx.hdrs['access-control-allow-methods'] = req_method
+        end
+
+        return ctx:render({
+            status = 201,
+            text = ""
+        })
+    end
+
+    return tsgi.next(ctx)
 end
 
 function _U.bind_security(ctx)
@@ -585,13 +689,11 @@ function _U.bind_security(ctx)
                 ctx.authorization, err = auth_handler(ctx.path,  security.scope, auth_data, additional)
 
                 if err then
-                    --local resp = tsgi.next(ctx)
                     return httpd.security_error_handler(ctx, err)
                 end
             end
         else
-            local resp = tsgi.next(ctx)
-            return httpd.security_error_handler(resp, "Security handler is not implemented")
+            return httpd.security_error_handler(ctx, "Security handler is not implemented")
         end
     end
 
@@ -1017,13 +1119,6 @@ function _T.set_env(ctx)
     if not ctx.openapi.server_settings then
         error("Test server settings not set")
     end
-
-    --local server_settings = fun.filter(
-    --    function(val)
-    --        return val.description == "test"
-    --    end,
-    --    server_settings
-    --):totable()[1]
 
     _T.server_settings = ctx.openapi.server_settings
     _T.set_manual_tests()

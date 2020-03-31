@@ -66,8 +66,4 @@ function _M.bad_request(self)
     })
 end
 
-function _M.cors_response(ctx)
-
-end
-
 return _M
