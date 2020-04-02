@@ -146,6 +146,8 @@ function mt:__call(httpd, router, spec_path, options)
 
     httpd.default                 = _U.httpd_default_handler
     httpd.error_handler           = _U.httpd_error_handler
+    httpd.not_found_handler       = _U.httpd_not_found_handler
+    httpd.bad_request_handler     = _U.httpd_bad_request_handler
     httpd.security_error_handler  = _U.httpd_security_error_handler
 
     _T.httpd_start = httpd.start
@@ -419,7 +421,7 @@ function _M:new(spec)
         if next(errors) then
             local httpd = ctx['tarantool.http.httpd']
 
-            return httpd.error_handler(ctx, errors)
+            return httpd.bad_request_handler(ctx, errors)
         end
 
         return tsgi.next(ctx)
@@ -481,7 +483,7 @@ end
 
 -- utility functions
 function _U.bearer(ctx)
-    local header = ctx:headers().authorization
+    local header = ctx:header("authorization")
 
     if not header then
         return
@@ -491,7 +493,7 @@ function _U.bearer(ctx)
 end
 
 function _U.basic(ctx)
-    local header = ctx:headers().authorization
+    local header = ctx:header("authorization")
 
     if not header then
         return
@@ -505,7 +507,7 @@ function _U.basic(ctx)
 end
 
 function _U.apiKey(ctx, name, goes_in)
-    local headers = ctx:headers()
+    local headers = ctx:header("authorization")
 
     if goes_in == "header" then
         return headers[name:lower()]
@@ -585,8 +587,8 @@ function _U.handle_cors(ctx)
 
     ctx.hdrs = {}
 
-    local req_method = ctx:headers()['access-control-request-method'] or ctx:method()
-    local req_headers = ctx:headers()['access-control-request-headers']
+    local req_method = ctx:header("access-control-request-method") or ctx:method()
+    local req_headers = ctx:header("access-control-request-headers")
 
     if req_headers then
         req_headers = req_headers:split(",")
@@ -601,7 +603,7 @@ function _U.handle_cors(ctx)
                 text = ""
             })
         end
-        return util.bad_request(ctx)
+        return httpd.bad_request_handler(ctx)
     end
 
     ctx.endpoint = route.endpoint
@@ -614,8 +616,8 @@ function _U.handle_cors(ctx)
     if fun.any(function(v) return v=="*" end, httpd.options.cors.allow_origin) then
         ctx.hdrs["access-control-allow-origin"] = "*"
     else
-        if fun.any(function(v) return v==ctx:headers()["origin"] end, httpd.options.cors.allow_origin) then
-            ctx.hdrs["access-control-allow-origin"] = ctx:headers()["origin"]
+        if fun.any(function(v) return v==ctx:header("origin") end, httpd.options.cors.allow_origin) then
+            ctx.hdrs["access-control-allow-origin"] = ctx:header("origin")
         end
     end
 
@@ -738,6 +740,48 @@ function _U.httpd_security_error_handler(self, f)
     self.security_error_handler = init
 end
 
+function _U.httpd_bad_request_handler(self, f)
+    if type(f) ~= "function" then
+        return self:render({
+            status = 400,
+            json = {
+                error = f
+            }
+        })
+    end
+
+    local init = function(ctx, err)
+        return f(ctx, err)
+    end
+    self.bad_request_handler = init
+end
+
+function _U.httpd_not_found_handler(self, f, pattern)
+    local router = self:router()
+
+    if self.http_404_swap then
+        return
+    end
+
+    if type(f) == "function" then
+        router:route(
+            {
+                method = "ANY",
+                path   = pattern or "/*path"
+            },
+            f
+        )
+        self.http_404_swap = true
+        return
+    end
+
+    router:route({
+        path = pattern or "/*path",
+        file = "404.html"
+    })
+    self.http_404_swap = true
+end
+
 _U.ni_patterns = {
     [[Can't load module '(.*)': '(.*)']],
     [[Controller '(.*)' doesn't contain function '(.*)']],
@@ -749,9 +793,8 @@ _U.ni_patterns = {
 -- validation functions
 function _V.validate(ctx)
     local c, a = ctx.endpoint.controller, ctx.endpoint.action
-    local headers = ctx:headers()
 
-    local ctype = headers['content-type']
+    local ctype = ctx:header("content-type")
     local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
 
     if not req_path then
@@ -849,7 +892,7 @@ function _V.validate_query(ctx, spec, res)
     if next(stash) then
         stash = fun.map(
             function(name)
-                return name, ctx:stash(name)
+                return name, stash[name]
             end,
             stash
         ):tomap()
@@ -1083,6 +1126,10 @@ end
 function _T.start(ctx)
     if fun.any(function(val) return val == "--test" end, arg) then
         return _T.run(ctx)
+    end
+
+    if not ctx.http_404_swap then
+        ctx:not_found_handler()
     end
 
     return _T.httpd_start(ctx)

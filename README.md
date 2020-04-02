@@ -158,8 +158,8 @@ local app = openapi(
     }
 )
  
--- the default return value
--- ctx is a context value, that is a request object here
+-- the default error override
+-- invalid repsponse format, or some crucial option that is not set for the endpoint will end up here
 app:default(
     function(ctx, err)
          return ctx:render({
@@ -173,7 +173,7 @@ app:default(
     end
 )
  
--- this will catch all request validation exceptions, etc. 
+-- all unexpected errors during the call of the actual handler will end up here
 app:error_handler(
     function(ctx, err)
          -- err argument here will be a table most of the time
@@ -197,6 +197,37 @@ app:security_error_handler(
                  message = err
              }   
          })
+    end
+)
+
+-- override the default 404 handler if needed
+-- 404.html file form the "/templates" folder will be rendered by default
+-- the second parameter is the matching pattern
+app:not_found_handler(
+    function(ctx)
+        return ctx:render({
+            status = 404,
+            json = {
+                success = false,
+                error   = "Not found"            
+            }
+        })
+    end,
+    "/api/v1/*path"
+)
+
+-- all of the request parameters validation errors would end up here
+-- by default the response in json = { error = err } with http-status of 400
+app:bad_request_handler(
+    function(ctx, err)
+        ctx:render({
+            status = 400,
+            json = {
+                success = false,
+                error   = err,
+                msg     = "Bad request"
+            }       
+        })  
     end
 )
 ```

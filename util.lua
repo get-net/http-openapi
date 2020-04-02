@@ -57,13 +57,4 @@ function _M.not_implemented(self, tag, operation_id)
     })
 end
 
-function _M.bad_request(self)
-    return self:render({
-        status = 400,
-        json = {
-            error = "Bad Request"
-        }
-    })
-end
-
 return _M
