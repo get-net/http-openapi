@@ -16,7 +16,7 @@ local util          = require("gtn.util")
     set variables for test cases beforehand
     kinda lazy-loading
 ]]
-local json, tap, uri
+local json, tap
 
 local default_cors = {
     max_age = 3600,
@@ -507,12 +507,11 @@ function _U.basic(ctx)
 end
 
 function _U.apiKey(ctx, name, goes_in)
-    local headers = ctx:header("authorization")
-
     if goes_in == "header" then
-        return headers[name:lower()]
+        local n = name:lower()
+        return ctx:header(n)
     elseif goes_in == "cookie" then
-        local val = headers["cookie"]
+        local val = ctx:header("cookie")
 
         return val and val:match(("%s=([^;]*)"):format(name)) or ""
     end
@@ -1174,8 +1173,22 @@ function _T.set_env(ctx)
 end
 
 function _T.run(ctx)
+    if fun.any(function(val) return val == "coverage" end, arg)  then
+        local app_router = ctx:router()
+
+        local coverage_report = _T.coverage(app_router)
+
+        print("FAILED TOTAL: ", coverage_report.count)
+        if next(coverage_report.paths) then
+            print("FAILED PATHS: ")
+            print(table.concat(coverage_report.paths, "\n"))
+        end
+
+        os.exit(1)
+    end
+
     -- set variables set before to respective modules
-    json, tap, uri = require("json"), require("tap"), require("net.url")
+    json, tap = require("json"), require("tap")
 
     -- set local http-client instance just for testing purposes and nothing else
     _T.client = require("http.client").new({5})
@@ -1248,7 +1261,7 @@ function _T.form_request(method, relpath, query, body, opts)
     settings.path = relpath
     settings.port = _T.server_settings.port
     settings.path = settings.path:gsub("//", "/")
-    settings.query = uri.buildQuery(query)
+    settings.query = neturl.buildQuery(query)
 
     if method ~= "GET" then
         if opts.headers['content-type'] == 'application/x-www-form-urlencoded' then
@@ -1504,6 +1517,37 @@ function _T.run_user_tests()
             end
         end
     end
+end
+
+function _T.coverage(app_router)
+    return fun.reduce(
+        function(res, route)
+            if route.openapi_path then
+                local status, module = pcall(require, "controllers."..route.controller)
+
+                local failed = false
+                if not status then
+                    failed = true
+                elseif route.action and not type(module) == "table" then
+                    failed = true
+                elseif route.action and not module[route.action] then
+                    failed = true
+                end
+
+                if failed then
+                    res.count = res.count + 1
+                    table.insert(res.paths, route.openapi_path)
+                end
+            end
+
+            return res
+        end,
+        {
+            count = 0,
+            paths = {}
+        },
+        app_router.routes
+    )
 end
 
 return _M
