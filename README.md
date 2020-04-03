@@ -232,6 +232,40 @@ app:bad_request_handler(
 )
 ```
 
+## Describing multipart/form-data request
+
+You'll need to describe the operation object's schema properly so that request validation won't fail.
+This is a standard format of **multipart/form-data** request
+
+```yaml
+post:
+  tags:
+    - main
+  operationId: 'multipart'
+  requestBody:
+    content:
+      multipart/form-data:
+        schema:
+          type: object
+          properties:
+            id:
+              type: string
+            file:
+              type: object
+              properties:
+                data:
+                  type: string
+                mime:
+                  type: string
+                headers:
+                  type: object
+                  properties:
+                    filename:
+                      type: string
+                    name:
+                      type: string
+```
+
 ## CORS handling
 You may set cors handling by setting the **cors** option to your openapi instance initialization
 

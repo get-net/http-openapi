@@ -408,6 +408,8 @@ function _M:new(spec)
         ctx.endpoint = r.endpoint
         ctx.stash    = r.stash
 
+        _U.post_param(ctx)
+
         if not ctx.render_swap then
             _U.render(ctx)
         end
@@ -574,6 +576,75 @@ function _U.handler(ctx)
         return resp
     end
     ctx.handler_swap = true
+end
+
+local function request_multipart(self)
+    local body = self:read_cached()
+
+    local sep = "--"..self:header("content-type"):match("boundary=(.+)"):gsub("-", "%%-")
+    local s, e = body:find(sep.."\r\n")
+    local eor = false
+
+    local t = {}
+
+    while not eor do
+        local _s, _e = body:find(sep, e)
+        if body:endswith("--", _e, _e + 2) then
+            eor = true
+        end
+
+        local param_part = body:match("%aontent%-%aisposition:.-; (.-)\r\n\r\n", e - 1)
+
+        -- eh. simple fix
+        if not param_part then
+            param_part = body:match("CONTENT%-DISPOSITION:.-; (.-)\r\n\r\n", e - 1)
+        end
+
+        param_part = param_part:gsub(";", "")
+
+        local mime_type = body:match("%aontent%-%aype: (.-)\r\n", e - 1)
+
+        if not mime_type then
+            mime_type = body:match("CONTENT%-TYPE: (.-)\r\n", e - 1)
+        end
+
+        local content = {}
+
+        for key, val in param_part:gmatch("(.-)=\"(.-)\"") do
+            rawset(content, key:strip(), val:strip())
+        end
+
+        local value = body:sub(e, _s - 1):match("\r\n\r\n(.-)\r\n$")
+
+        rawset(
+            t,
+            content.name,
+            content.filename and {data = value, headers = content, mime = mime_type} or value
+        )
+
+        s, e = _s, _e + 2
+    end
+
+    return t
+end
+
+-- solely to parse multipart
+function _U.post_param(ctx)
+    local initial = ctx.post_param
+    local ctype   = ctx:content_type()
+
+    local handle = function(ctx, name)
+        local params = request_multipart(ctx)
+
+        return name and params[name] or params
+    end
+
+    if ctype == "multipart/form-data" then
+        ctx.post_param = handle
+        return
+    end
+
+    ctx.port_param = initial
 end
 
 function _U.handle_cors(ctx)
@@ -870,6 +941,7 @@ function _V.validate(ctx)
                 ctx arg goes last as optional, 'cause this call may execute
                 object validation as well as string or an array validation
             ]]
+
             if cache.body.type then
                 res = _V[cache.body.type](post, cache.body, ctx)
             end
