@@ -758,7 +758,7 @@ function _U.bind_security(ctx)
                 return httpd.security_error_handler(ctx, "Authorization data not found")
             else
                 local err
-                ctx.authorization, err = auth_handler(ctx.path,  security.scope, auth_data, additional)
+                ctx.authorization, err = auth_handler(ctx:path(),  security.scope, auth_data, additional)
 
                 if err then
                     return httpd.security_error_handler(ctx, err)
