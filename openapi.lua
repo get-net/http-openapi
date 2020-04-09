@@ -171,12 +171,15 @@ function _M:new(spec)
     end
 
     function self:form_params(path, method, ctype)
-        local body = {}
-        if method == "post" and ctype then
-            body = self.paths[path][method].requestBody
+        local opts = self.paths[path]
+
+        if not opts then
+            error(("Path options not found: %s"):format(path))
         end
 
-        local query = self.paths[path][method].parameters
+        local body = opts[method].requestBody
+
+        local query = opts[method].parameters
 
         local result = {
             query = query or {}
@@ -187,7 +190,9 @@ function _M:new(spec)
                 return result
             end
 
-            body = self:form_post(body.content[ctype].schema)
+            if body.content then
+                body = self:form_post(body.content[ctype].schema)
+            end
             result.body  = body
         end
 
