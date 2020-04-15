@@ -520,9 +520,9 @@ function _U.apiKey(ctx, name, goes_in)
 end
 
 -- overrides response render handling
-function _U.render(ctx)
-    local render_func = ctx.render
-    ctx.render = function(ctx, input)
+function _U.render(self)
+    local render_func = self.render
+    self.render = function(ctx, input)
         local resp = render_func(ctx, input)
 
         resp.status = input.status
@@ -541,14 +541,14 @@ function _U.render(ctx)
 
         return resp
     end
-    ctx.render_swap = true
+    self.render_swap = true
 end
 
 -- overrides route handler with this one
-function _U.handler(ctx)
-    local handler_func = ctx.endpoint.handler
+function _U.handler(self)
+    local handler_func = self.endpoint.handler
 
-    ctx.endpoint.handler = function(ctx)
+    self.endpoint.handler = function(ctx)
         local status, resp = pcall(handler_func, ctx)
 
         local httpd = ctx['tarantool.http.httpd']
@@ -575,7 +575,7 @@ function _U.handler(ctx)
 
         return resp
     end
-    ctx.handler_swap = true
+    self.handler_swap = true
 end
 
 local function request_multipart(self)
@@ -629,22 +629,14 @@ local function request_multipart(self)
 end
 
 -- solely to parse multipart
-function _U.post_param(ctx)
-    local initial = ctx.post_param
-    local ctype   = ctx:content_type()
+function _U.post_param(self)
+    if self:content_type() == "multipart/form-data" then
+        self.post_param = function(ctx, name)
+             local params = request_multipart(ctx)
 
-    local handle = function(ctx, name)
-        local params = request_multipart(ctx)
-
-        return name and params[name] or params
+             return name and params[name] or params
+         end
     end
-
-    if ctype == "multipart/form-data" then
-        ctx.post_param = handle
-        return
-    end
-
-    ctx.port_param = initial
 end
 
 function _U.handle_cors(ctx)
@@ -782,10 +774,9 @@ function _U.httpd_default_handler(self, f)
         })
     end
 
-    local init = function(ctx, err)
-        return f(ctx, err)
+    self.default = function(ctx, err)
+       return f(ctx, err)
     end
-    self.default = init
 end
 
 function _U.httpd_error_handler(self, f, ...)
@@ -793,10 +784,9 @@ function _U.httpd_error_handler(self, f, ...)
         error(f)
     end
 
-    local init = function(ctx, err)
+    self.error_handler = function(ctx, err)
         return f(ctx, err)
     end
-    self.error_handler = init
 end
 
 function _U.httpd_security_error_handler(self, f)
@@ -804,10 +794,9 @@ function _U.httpd_security_error_handler(self, f)
         error(f)
     end
 
-    local init = function(ctx, err)
+    self.security_error_handler = function(ctx, err)
         return f(ctx, err)
     end
-    self.security_error_handler = init
 end
 
 function _U.httpd_bad_request_handler(self, f)
@@ -820,10 +809,9 @@ function _U.httpd_bad_request_handler(self, f)
         })
     end
 
-    local init = function(ctx, err)
-        return f(ctx, err)
+    self.bad_request_handler = function(ctx, err)
+       return f(ctx, err)
     end
-    self.bad_request_handler = init
 end
 
 function _U.httpd_not_found_handler(self, f, pattern)
