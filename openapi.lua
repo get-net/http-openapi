@@ -269,7 +269,7 @@ function _U.bearer(ctx)
         return
     end
 
-    return header:match("Bearer (%w+)")
+    return header:match("Bearer (.*)")
 end
 
 function _U.basic(ctx)
@@ -279,7 +279,7 @@ function _U.basic(ctx)
         return
     end
 
-    local creds = base64_decode(header:match("Basic (%w+)"))
+    local creds = base64_decode(header:match("Basic (.*)"))
     if not creds then
         return
     end
