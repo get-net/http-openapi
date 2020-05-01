@@ -9,6 +9,10 @@ local fun           = require("fun")
 -- lua modules
 local neturl        = require("net.url")
 
+-- http modules
+local http_utils    = require('http.utils')
+local lib           = require("http.lib")
+
 -- helpers
 local util          = require("gtn.util")
 
@@ -418,6 +422,8 @@ function _M:new(spec)
             _U.handler(ctx)
         end
 
+        ctx.query_param = _U.query_param
+
         local errors = _V.validate(ctx)
 
         if next(errors) then
@@ -517,6 +523,31 @@ function _U.apiKey(ctx, name, goes_in)
 
         return val and val:match(("%s=([^;]*)"):format(name)) or ""
     end
+end
+
+-- bad unescape fpr query parameters
+function _U.cached_query_param(self, name)
+    if name == nil then
+        return self.query_params
+    end
+    return self.query_params[ name ]
+end
+
+function _U.query_param(self, name)
+    if self:query() ~= nil and string.len(self:query()) == 0 then
+        rawset(self, 'query_params', {})
+    else
+        local params = lib.params(self['QUERY_STRING'])
+        local pres = {}
+        for k, v in pairs(params) do
+            pres[ http_utils.uri_unescape(k) ] = http_utils.uri_unescape(v, true)
+            print("well?",v)
+        end
+        rawset(self, 'query_params', pres)
+    end
+
+    rawset(self, 'query_param', _U.cached_query_param)
+    return self:query_param(name)
 end
 
 -- overrides response render handling
@@ -632,10 +663,10 @@ end
 function _U.post_param(self)
     if self:content_type() == "multipart/form-data" then
         self.post_param = function(ctx, name)
-             local params = request_multipart(ctx)
+            local params = request_multipart(ctx)
 
-             return name and params[name] or params
-         end
+            return name and params[name] or params
+        end
     end
 end
 
@@ -775,7 +806,7 @@ function _U.httpd_default_handler(self, f)
     end
 
     self.default = function(ctx, err)
-       return f(ctx, err)
+        return f(ctx, err)
     end
 end
 
@@ -810,7 +841,7 @@ function _U.httpd_bad_request_handler(self, f)
     end
 
     self.bad_request_handler = function(ctx, err)
-       return f(ctx, err)
+        return f(ctx, err)
     end
 end
 
