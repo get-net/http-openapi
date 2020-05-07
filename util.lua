@@ -3,10 +3,10 @@ local fun = require("fun")
 local _M = {}
 
 function _M.read_config()
-    local env = arg[1] or "staging"
+    local env = arg[1] or "development"
 
     if env:startswith("--") then
-        env = "staging"
+        env = "development"
     end
 
     local status, conf = pcall(require, "config."..env)
