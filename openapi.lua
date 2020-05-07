@@ -353,7 +353,7 @@ function _M:new(spec)
         local query = opts[method].parameters
 
         local result = {
-            query = query or {}
+            _query = query or {}
         }
 
         if body then
@@ -362,7 +362,7 @@ function _M:new(spec)
             end
 
             body = self:form_post(body.content[ctype].schema)
-            result.body  = body
+            result._body  = body
         end
 
         return result
@@ -541,7 +541,6 @@ function _U.query_param(self, name)
         local pres = {}
         for k, v in pairs(params) do
             pres[ http_utils.uri_unescape(k) ] = http_utils.uri_unescape(v, true)
-            print("well?",v)
         end
         rawset(self, 'query_params', pres)
     end
@@ -951,18 +950,18 @@ function _V.validate(ctx)
 
     local res = {}
 
-    if method ~= "get" and cache.body then
+    if method ~= "get" and cache._body then
         local post = ctx:post_param()
 
         _V.runs = 0
-        if cache.body then
+        if cache._body then
             --[[
                 ctx arg goes last as optional, 'cause this call may execute
                 object validation as well as string or an array validation
             ]]
 
-            if cache.body.type then
-                res = _V[cache.body.type](post, cache.body, ctx)
+            if cache._body.type then
+                res = _V[cache._body.type](post, cache._body, ctx)
             end
 
             if _V.runs <= 0 then
@@ -971,7 +970,7 @@ function _V.validate(ctx)
         end
     end
 
-    _V.validate_query(ctx, cache.query, res)
+    _V.validate_query(ctx, cache._query, res)
     return res or {}
 end
 
@@ -1529,8 +1528,8 @@ function _T.run_path_tests(ctx)
 
                 local body, query = {}, {}
 
-                if method ~= "get" and params.body then
-                    params.body.required = params.body.required or {}
+                if method ~= "get" and params._body then
+                    params._body.required = params._body.required or {}
                     body = fun.map(
                         function(name, vars)
                             --[[
@@ -1538,17 +1537,17 @@ function _T.run_path_tests(ctx)
                                  then assert that it has an example value set in openapi schema
                                  throw an error otherwise
                             ]]
-                            if fun.any(function(val) return val == name end,params.body.required) then
+                            if fun.any(function(val) return val == name end,params._body.required) then
                                 local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, _path)
                                 assert(vars.example, msg)
                             end
                             return name, vars.example
                         end,
-                        params.body.properties
+                        params._body.properties
                     ):tomap()
                 end
 
-                if params.query then
+                if params._query then
                     query = fun.map(
                         function(vars)
                             local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, _path)
@@ -1567,7 +1566,7 @@ function _T.run_path_tests(ctx)
 
                             return vars,name
                         end,
-                        params.query
+                        params._query
                     ):tomap()
                 end
 
