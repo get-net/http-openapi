@@ -1,10 +1,13 @@
 -- tnt modules
 local base64_encode = require("digest").base64_encode
 local base64_decode = require("digest").base64_decode
+local fiber         = require('fiber')
 local tsgi          = require("http.tsgi")
 local uuid          = require("uuid")
 local fio           = require("fio")
 local fun           = require("fun")
+
+local prometheus, metrics
 
 -- lua modules
 local neturl        = require("net.url")
@@ -52,6 +55,7 @@ local function read_spec(spec_path)
 end
 
 local _M = {}
+local _P = {}
 local _V = {}
 local _U = {}
 local _T = {}
@@ -107,6 +111,7 @@ function mt:__call(httpd, router, spec_path, options)
 
             v = _cors
         end
+
         rawset(httpd.options, k, v)
     end
 
@@ -146,6 +151,10 @@ function mt:__call(httpd, router, spec_path, options)
         end
 
         router:route(v.options, v.controller)
+    end
+
+    if options.metrics then
+        _P.bind_metrics(httpd)
     end
 
     httpd.default                 = _U.httpd_default_handler
@@ -489,6 +498,76 @@ function _M:new(spec)
     return obj
 end
 
+function _P.bind_metrics(httpd)
+    local router = assert(httpd:router(), "router is not set")
+    local prefix = assert(httpd.options.metrics.prefix, "Please set 'prefix' options for your metrics config")
+    local path = httpd.options.metrics.path
+    local options = httpd.options.metrics.collect
+
+    local status, _p = pcall(require, "prometheus")
+
+    assert(status, "Prometheus module is not installed")
+
+    prometheus = _p
+
+    if options and type(options) == "table" then
+        for _, opt in next, options do
+            if opt.watch then
+                opt.type = "counter"
+            end
+
+            local operation = assert(prometheus[opt.type], ("Invalid metric type %s"):format(opt.type))
+
+            local _op = operation(("%s_%s"):format(prefix, opt.name), opt.description)
+
+            if opt.type == "gauge" and opt.call then
+                assert(type(opt.call == "function"), ("call option is not a function for %s"):format(opt.name))
+
+                local handle = _P.fiber_operation
+
+                fiber.create(handle, _op, opt.call, opt.step)
+            end
+
+            if opt.watch then
+                local cont = function(env)
+                    _op:inc(1)
+                    return tsgi.next(env)
+                end
+
+                router:use(
+                    cont,
+                    {
+                        name     = "metrics#"..opt.watch,
+                        method   = opt.method,
+                        path     = opt.watch
+                    }
+                )
+            end
+        end
+    end
+
+    metrics = {
+        security_errors = prometheus.counter(("%s_security_errors"):format(prefix), "Security error counter"),
+        errors          = prometheus.counter(("%s_unhandled_errors"):format(prefix), "Unhandled error counter")
+    }
+
+    router:route({
+        path = path
+    },
+        prometheus.collect_http
+    )
+end
+
+function _P.fiber_operation(operation, f, step)
+    while true do
+        local val = f()
+
+        operation:set(val)
+        fiber.sleep(step or 15)
+    end
+end
+
+
 -- utility functions
 function _U.bearer(ctx)
     local header = ctx:header("authorization")
@@ -815,6 +894,10 @@ function _U.httpd_error_handler(self, f, ...)
     end
 
     self.error_handler = function(ctx, err)
+        if metrics and metrics.errors then
+            metrics.errors:inc(1)
+        end
+
         return f(ctx, err)
     end
 end
@@ -825,6 +908,10 @@ function _U.httpd_security_error_handler(self, f)
     end
 
     self.security_error_handler = function(ctx, err)
+        if metrics and metrics.security_errors then
+            metrics.security_errors:inc(1)
+        end
+
         return f(ctx, err)
     end
 end
