@@ -116,7 +116,7 @@ function mt:__call(httpd, router, spec_path, options)
     end
 
     for _, v in next, routes do
-        if v.options.security then
+        if v.options.security or httpd.openapi.global_security then
             router:use(
                 _U.bind_security,
                 {
