@@ -1152,7 +1152,8 @@ function _V.object(val, spec, ctx)
         function(key, param)
             local k, v = next(param)
             if k == "$ref" then
-                local reference = ctx.httpd.openapi:ref(v)
+                local httpd = ctx['tarantool.http.httpd']
+                local reference = httpd.openapi:ref(v)
                 if reference then
                     param = reference
                     required = reference.required or {}
