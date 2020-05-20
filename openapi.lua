@@ -1237,6 +1237,7 @@ function _V.integer(i)
     return type(i) == "number"
 end
 
+_V.number = _V.integer
 _V.double = _V.integer
 _V.float  = _V.integer
 _V.int32  = _V.integer
