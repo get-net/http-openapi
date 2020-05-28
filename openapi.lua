@@ -305,6 +305,11 @@ function _M:new(spec)
 
     function self:parse_security_schemes(scheme)
         local _, v = next(scheme)
+
+        if not v then
+            return {}
+        end
+
         local key, scope = next(v)
         local options
         if self.components.securitySchemes then
@@ -839,7 +844,7 @@ function _U.bind_security(ctx)
 
     local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and httpd.openapi.global_security)
 
-    if security ~= nil then
+    if security ~= nil and next(security) then
         local auth_handler
         if not httpd.options.security then
             local resp = tsgi.next(ctx)
