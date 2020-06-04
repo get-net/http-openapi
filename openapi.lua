@@ -28,31 +28,9 @@ local json, tap
 local default_cors = {
     max_age = 3600,
     allow_credentials = true,
-    allow_headers = {"Authorization, Content-Type"},
-    allow_origin = {"*"}
+    allow_headers = { "Authorization, Content-Type" },
+    allow_origin = { "*" }
 }
-
-local function read_spec(spec_path)
-    assert(
-        fio.path.is_file(spec_path),
-        ("Spec file %s does not exist"):format(spec_path)
-    )
-
-    local tab = spec_path:split(".")
-    local ext = tab[#tab]
-    assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
-    local decoder = require(ext)
-    local file = fio.open(spec_path, {"O_RDONLY"})
-
-    local data = file:read()
-    local status, res = pcall(decoder.decode, data)
-    assert(
-        status,
-        ("Specification file %s is not valid"):format(spec_path)
-    )
-
-    return res
-end
 
 local _M = {}
 local _P = {}
@@ -61,12 +39,442 @@ local _U = {}
 local _T = {}
 local mt = {}
 
-function mt:__call(httpd, router, spec_path, options)
-    local openapi = self:new(read_spec(spec_path))
+-- validation functions
+function _V.validate(ctx)
+    local c, a = ctx.endpoint.controller, ctx.endpoint.action
+
+    local ctype = ctx:header("content-type")
+    local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
+
+    if not req_path then
+        return
+    end
+
+    if ctype then
+        local with_charset = ctype:match("(%S+)[;]:?")
+
+        if with_charset then
+            ctype = with_charset
+        end
+    end
+
+    local httpd = ctx['tarantool.http.httpd']
+
+    local has, err = httpd.openapi:has_params(req_path, method, ctype)
+
+    if err then
+        return {err}
+    end
+
+    if not has then
+        return {}
+    end
+
+    httpd.cache = httpd.cache or {}
+
+    if not httpd.cache.params then
+        httpd.cache.params = {}
+    end
+
+    local cache = httpd.cache.params[c]
+
+    if not cache then
+        httpd.cache.params[c] = {}
+    end
+
+    cache = not a and cache or httpd.cache.params[c][a]
+
+    if not cache then
+        if a then
+            httpd.cache.params[c][a] = {}
+            cache = httpd.cache.params[c][a]
+        else
+            httpd.cache.params[c] = {}
+            cache = httpd.cache.params[c]
+        end
+    end
+
+    if not next(cache) then
+        local params, p_err = httpd.openapi:form_params(req_path, method, ctype)
+
+        if p_err then
+            error(p_err)
+        end
+
+        if action then
+            httpd.cache.params[c][a] = params
+        else
+            httpd.cache.params[c] = params
+        end
+        cache = params
+    end
+
+    local res = {}
+
+    if method ~= "get" and cache._body then
+        local post = ctx:post_param()
+
+        _V.runs = 0
+        if cache._body then
+            --[[
+                ctx arg goes last as optional, 'cause this call may execute
+                object validation as well as string or an array validation
+            ]]
+
+            if cache._body.type then
+                res = _V[cache._body.type](post, cache._body, ctx)
+            end
+
+            if _V.runs <= 0 then
+                res = next(res) and {body = res} or res
+            end
+        end
+    end
+
+    _V.validate_query(ctx, cache._query, res)
+    return res or {}
+end
+
+function _V.validate_query(ctx, spec, res)
+    local query = ctx:query_param()
+    local stash = ctx.endpoint.stash
+
+    if next(stash) then
+        stash = fun.map(
+            function(name)
+                return name, stash[name]
+            end,
+            stash
+        ):tomap()
+    end
+
+    if not next(spec) and (next(query) or next(stash)) then
+        return fun.chain(query, stash):reduce(
+            function(_res, key)
+                _res[key] =_V.p_error("unknown")
+                return _res
+            end,
+            res
+        )
+    else
+        fun.chain(query, stash):reduce(
+            function(_res, key)
+                if not fun.any(function(val) return val.name == key end, spec) then
+                    _res[key] = _V.p_error("unknown")
+                end
+                return _res
+            end,
+            res
+        )
+    end
+
+    return fun.reduce(
+        function(_res, param)
+            local value
+            if param['in'] == "query" then
+                value = query[param.name]
+            elseif param['in'] == "path" then
+                value = stash[param.name]
+            end
+
+            if value == nil and not param.required then
+                return _res
+            end
+
+            if not value then
+                _res[param.name] = _V.p_error("missing")
+                return _res
+            end
+
+            local vtype = param.schema.format or param.schema.type
+
+            if not _V[vtype](value) then
+                _res[param.name] = _V.p_error("invalid", vtype, type(value))
+            end
+
+            if param.schema.enum then
+                local ok = _V.enum(value, param.schema.enum)
+
+                if not ok and not param.schema.nullable then
+                    _res[param.name] = _V.p_error("invalid", param.schema.enum, value)
+                end
+            end
+
+            return _res
+        end,
+        res,
+        spec
+    )
+end
+
+function _V.object(val, spec, ctx)
+    if not _V.is_object(val) then
+        -- in case of no actual parameters and no required ones
+        if not next(val) and not spec.required then
+            return {}
+        end
+
+        local first_run = (_V.runs == 0)
+        return first_run and _V.p_error("invalid", "object", type(val)) or false
+    end
+
+    _V.runs = _V.runs + 1
+    local required = spec.required or {}
+    local obj = spec.properties
+
+    local absent = fun.map(
+        function(key, param)
+            local k, v = next(param)
+            if k == "$ref" then
+                local httpd = ctx['tarantool.http.httpd']
+                local reference = httpd.openapi:ref(v)
+                if reference then
+                    param = reference
+                    required = reference.required or {}
+                    obj[key] = param
+                end
+            end
+
+            local is_required = fun.any(
+                function(_v)
+                    return _v == key
+                end,
+                required
+            )
+
+            if is_required and not val[key] then
+                return key, _V.p_error("missing")
+            end
+            return key, nil
+        end,
+        obj
+    ):tomap()
+
+    return fun.reduce(
+        function(res, key, param)
+            if not obj[key] then
+                rawset(res, key, _V.p_error("unknown"))
+                return res
+            end
+
+            local ptype = obj[key].format or obj[key].type
+
+            local r
+
+            if ptype == "object" then
+                r = _V[ptype](val[key], obj[key], ctx)
+            else
+                r = _V[ptype](param)
+            end
+            if not r then
+                rawset(res, key, _V.p_error("invalid", ptype, type(param)))
+                return res
+            end
+
+            if type(r) == "table" and next(r) then
+                if not _V.is_object(r) then
+                    rawset(res, key, r)
+                    return res
+                end
+
+                local _t = {}
+                for k, v in next, r do
+                    rawset(_t, k, v)
+                end
+                rawset(res, key, _t)
+            end
+
+            return res
+        end,
+        absent,
+        val
+    )
+end
+
+function _V.is_object(obj)
+    if type(obj) ~= "table" then
+        return false
+    end
+    local k, v = next(obj)
+    return type(k) == "string" and v ~= nil
+end
+
+function _V.string(s)
+    return type(s) == "string"
+end
+
+_V.password = _V.string
+_V.byte     = _V.string
+_V.binary   = _V.string
+
+function _V.integer(i)
+    return type(i) == "number"
+end
+
+_V.number = _V.integer
+_V.double = _V.integer
+_V.float  = _V.integer
+_V.int32  = _V.integer
+_V.int64  = _V.integer
+
+function _V.email(email)
+    if not _V.string(email) then
+        return false
+    end
+    return email:match('[(%w+)%p*]+@[%w+%p*]+%.%a+$') ~= nil
+end
+
+function _V.uuid(str)
+    local s, res = pcall(uuid.fromstr, str)
+    return s and res ~= nil
+end
+
+function _V.array(t, param)
+    local first_run = (_V.runs == 0)
+    -- a clumsy hack
+    if type(t) ~= "table" or _V.is_object(t) then
+        return first_run and {
+            details = {
+                error    = "invalid",
+                expected = "array",
+                actual   = type(param)
+            }
+        } or false
+    end
+
+    return {}
+end
+
+function _V.enum(val, options)
+    return fun.any(function(v) return val == v end, options)
+end
+
+function _V.date(str)
+    -- lua can't match by length in any other way
+    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+    return ok ~= nil
+end
+
+function _V.boolean(val)
+    return val == true or val == false
+end
+
+_V['date-time'] = function(str)
+    -- same here. needs some thinking maybe later
+    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
+    return ok ~= nil
+end
+
+function _V.p_error(alias, expected, actual)
+    return {
+        details = {
+            error = alias,
+            expected = expected,
+            actual = actual
+        }
+    }
+end
+
+local function read_specfile(filepath)
+    assert(
+        fio.path.is_file(filepath),
+        ("Spec file %s does not exist"):format(filepath)
+    )
+
+    local tab = filepath:split(".")
+    local ext = tab[#tab]
+    assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
+    local decoder = require(ext)
+    local file = fio.open(filepath, {"O_RDONLY"})
+
+    local data = file:read()
+    local status, res = pcall(decoder.decode, data)
+    assert(
+        status,
+        ("Specification file %s is not valid"):format(filepath)
+    )
+
+    return res
+end
+
+--[[
+    initial primary schema mutation. NOTE: this is not copying
+    it's changes the original schema
+]]
+local function join_schemas(primary, secondary, field )
+    primary[field]   = primary[field] or {}
+    secondary[field] = secondary[field] or {}
+
+    primary[field] = fun.reduce(
+        function(res, k ,v)
+            -- do not override primary options with secondary ones
+            if not res[k] then
+                rawset(res, k ,v)
+            end
+
+            return res
+        end,
+        primary[field],
+        secondary[field]
+    )
+end
+
+local function read_spec(spec_conf)
+    local conf = {}
+
+    if type(spec_conf) == "table" then
+        assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
+
+        assert(spec_conf.base_path, "base_path option is not set")
+        assert(spec_conf.primary_schema, "primary_schema option is not set")
+
+        conf.primary = read_specfile(fio.pathjoin(spec_conf.base_path, spec_conf.primary_schema))
+
+        conf.secondary = {}
+
+        spec_conf.secondary_schemas = spec_conf.secondary_schemas or {}
+
+        for _, opts in next, spec_conf.secondary_schemas do
+            local _s = read_specfile(fio.pathjoin(spec_conf.base_path, opts.schema))
+
+            --[[
+                set internal option __extend for schemas that don't have their own distictive path option
+                those would be inserted into primary schema afterwards
+            ]]
+            opts.path = opts.path or "__extend"
+
+            if conf.secondary[opts.path] then
+                join_schemas(conf.secondary[opts.path], _s, "paths")
+                join_schemas(conf.secondary[opts.path], _s, "components")
+            else
+                rawset(conf.secondary, opts.path, _s)
+            end
+        end
+    end
+
+    if type(spec_conf) == "string" then
+        conf.primary = read_specfile(spec_conf)
+    end
+
+    return conf
+end
+
+function mt:__call(httpd, router, spec_conf, options)
+    local schemas = read_spec(spec_conf)
 
     if not app_config then
         util.read_config()
     end
+
+    -- we'll consider those as a part of the primary schema
+    if schemas.secondary.__extend then
+        join_schemas(schemas.primary, schemas.secondary.__extend, "paths")
+        join_schemas(schemas.primary, schemas.secondary.__extend, "components")
+    end
+
+    -- TODO handle secondary schemas with path here
+
+    local openapi = self:new(schemas.primary)
 
     local server_settings = openapi:read_server()
 
@@ -173,6 +581,7 @@ end
 
 setmetatable(_M, mt)
 
+-- main openapi handler prototype
 function _M:new(spec)
     local obj = spec or {}
 
@@ -503,6 +912,7 @@ function _M:new(spec)
     return obj
 end
 
+-- prometheus handlers
 function _P.bind_metrics(httpd)
     local router = assert(httpd:router(), "router is not set")
     local prefix = assert(httpd.options.metrics.prefix, "Please set 'prefix' options for your metrics config")
@@ -970,342 +1380,7 @@ _U.ni_patterns = {
 }
 
 
--- validation functions
-function _V.validate(ctx)
-    local c, a = ctx.endpoint.controller, ctx.endpoint.action
-
-    local ctype = ctx:header("content-type")
-    local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
-
-    if not req_path then
-        return
-    end
-
-    if ctype then
-        local with_charset = ctype:match("(%S+)[;]:?")
-
-        if with_charset then
-            ctype = with_charset
-        end
-    end
-
-    local httpd = ctx['tarantool.http.httpd']
-
-    local has, err = httpd.openapi:has_params(req_path, method, ctype)
-
-    if err then
-        return {err}
-    end
-
-    if not has then
-        return {}
-    end
-
-    httpd.cache = httpd.cache or {}
-
-    if not httpd.cache.params then
-        httpd.cache.params = {}
-    end
-
-    local cache = httpd.cache.params[c]
-
-    if not cache then
-        httpd.cache.params[c] = {}
-    end
-
-    cache = not a and cache or httpd.cache.params[c][a]
-
-    if not cache then
-        if a then
-            httpd.cache.params[c][a] = {}
-            cache = httpd.cache.params[c][a]
-        else
-            httpd.cache.params[c] = {}
-            cache = httpd.cache.params[c]
-        end
-    end
-
-    if not next(cache) then
-        local params, p_err = httpd.openapi:form_params(req_path, method, ctype)
-
-        if p_err then
-            error(p_err)
-        end
-
-        if action then
-            httpd.cache.params[c][a] = params
-        else
-            httpd.cache.params[c] = params
-        end
-        cache = params
-    end
-
-    local res = {}
-
-    if method ~= "get" and cache._body then
-        local post = ctx:post_param()
-
-        _V.runs = 0
-        if cache._body then
-            --[[
-                ctx arg goes last as optional, 'cause this call may execute
-                object validation as well as string or an array validation
-            ]]
-
-            if cache._body.type then
-                res = _V[cache._body.type](post, cache._body, ctx)
-            end
-
-            if _V.runs <= 0 then
-                res = next(res) and {body = res} or res
-            end
-        end
-    end
-
-    _V.validate_query(ctx, cache._query, res)
-    return res or {}
-end
-
-function _V.validate_query(ctx, spec, res)
-    local query = ctx:query_param()
-    local stash = ctx.endpoint.stash
-
-    if next(stash) then
-        stash = fun.map(
-            function(name)
-                return name, stash[name]
-            end,
-            stash
-        ):tomap()
-    end
-
-    if not next(spec) and (next(query) or next(stash)) then
-        return fun.chain(query, stash):reduce(
-            function(_res, key)
-                _res[key] =_V.p_error("unknown")
-                return _res
-            end,
-            res
-        )
-    else
-        fun.chain(query, stash):reduce(
-            function(_res, key)
-                if not fun.any(function(val) return val.name == key end, spec) then
-                    _res[key] = _V.p_error("unknown")
-                end
-                return _res
-            end,
-            res
-        )
-    end
-
-    return fun.reduce(
-        function(_res, param)
-            local value
-            if param['in'] == "query" then
-                value = query[param.name]
-            elseif param['in'] == "path" then
-                value = stash[param.name]
-            end
-
-            if value == nil and not param.required then
-                return _res
-            end
-
-            if not value then
-                _res[param.name] = _V.p_error("missing")
-                return _res
-            end
-
-            local vtype = param.schema.format or param.schema.type
-
-            if not _V[vtype](value) then
-                _res[param.name] = _V.p_error("invalid", vtype, type(value))
-            end
-
-            if param.schema.enum then
-                local ok = _V.enum(value, param.schema.enum)
-
-                if not ok and not param.schema.nullable then
-                    _res[param.name] = _V.p_error("invalid", param.schema.enum, value)
-                end
-            end
-
-            return _res
-        end,
-        res,
-        spec
-    )
-end
-
-function _V.object(val, spec, ctx)
-    if not _V.is_object(val) then
-        -- in case of no actual parameters and no required ones
-        if not next(val) and not spec.required then
-            return {}
-        end
-
-        local first_run = (_V.runs == 0)
-        return first_run and _V.p_error("invalid", "object", type(val)) or false
-    end
-
-    _V.runs = _V.runs + 1
-    local required = spec.required or {}
-    local obj = spec.properties
-
-    local absent = fun.map(
-        function(key, param)
-            local k, v = next(param)
-            if k == "$ref" then
-                local httpd = ctx['tarantool.http.httpd']
-                local reference = httpd.openapi:ref(v)
-                if reference then
-                    param = reference
-                    required = reference.required or {}
-                    obj[key] = param
-                end
-            end
-
-            local is_required = fun.any(
-                function(_v)
-                    return _v == key
-                end,
-                required
-            )
-
-            if is_required and not val[key] then
-                return key, _V.p_error("missing")
-            end
-            return key, nil
-        end,
-        obj
-    ):tomap()
-
-    return fun.reduce(
-        function(res, key, param)
-            if not obj[key] then
-                rawset(res, key, _V.p_error("unknown"))
-                return res
-            end
-
-            local ptype = obj[key].format or obj[key].type
-
-            local r
-
-            if ptype == "object" then
-                r = _V[ptype](val[key], obj[key], ctx)
-            else
-                r = _V[ptype](param)
-            end
-            if not r then
-                rawset(res, key, _V.p_error("invalid", ptype, type(param)))
-                return res
-            end
-
-            if type(r) == "table" and next(r) then
-                if not _V.is_object(r) then
-                    rawset(res, key, r)
-                    return res
-                end
-
-                local _t = {}
-                for k, v in next, r do
-                    rawset(_t, k, v)
-                end
-                rawset(res, key, _t)
-            end
-
-            return res
-        end,
-        absent,
-        val
-    )
-end
-
-function _V.is_object(obj)
-    if type(obj) ~= "table" then
-        return false
-    end
-    local k, v = next(obj)
-    return type(k) == "string" and v ~= nil
-end
-
-function _V.string(s)
-    return type(s) == "string"
-end
-
-_V.password = _V.string
-_V.byte     = _V.string
-_V.binary   = _V.string
-
-function _V.integer(i)
-    return type(i) == "number"
-end
-
-_V.number = _V.integer
-_V.double = _V.integer
-_V.float  = _V.integer
-_V.int32  = _V.integer
-_V.int64  = _V.integer
-
-function _V.email(email)
-    if not _V.string(email) then
-        return false
-    end
-    return email:match('[(%w+)%p*]+@[%w+%p*]+%.%a+$') ~= nil
-end
-
-function _V.uuid(str)
-    local s, res = pcall(uuid.fromstr, str)
-    return s and res ~= nil
-end
-
-function _V.array(t, param)
-    local first_run = (_V.runs == 0)
-    -- a clumsy hack
-    if type(t) ~= "table" or _V.is_object(t) then
-        return first_run and {
-            details = {
-                error    = "invalid",
-                expected = "array",
-                actual   = type(param)
-            }
-        } or false
-    end
-
-    return {}
-end
-
-function _V.enum(val, options)
-    return fun.any(function(v) return val == v end, options)
-end
-
-function _V.date(str)
-    -- lua can't match by length in any other way
-    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
-    return ok ~= nil
-end
-
-function _V.boolean(val)
-    return val == true or val == false
-end
-
-_V['date-time'] = function(str)
-    -- same here. needs some thinking maybe later
-    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
-    return ok ~= nil
-end
-
-function _V.p_error(alias, expected, actual)
-    return {
-        details = {
-            error = alias,
-            expected = expected,
-            actual = actual
-        }
-    }
-end
-
+-- automatic testing functions
 function _T.start(ctx)
     if fun.any(function(val) return val == "--test" end, arg) then
         return _T.run(ctx)
