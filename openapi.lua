@@ -60,7 +60,10 @@ function _V.validate(ctx)
 
     local httpd = ctx['tarantool.http.httpd']
 
-    local has, err = httpd.openapi:has_params(req_path, method, ctype)
+    local schema = ctx.endpoint.uid_schema and
+        httpd.openapi:get_secondary(ctx.endpoint.uid_schema) or httpd.openapi
+
+    local has, err = schema:has_params(req_path, method, ctype)
 
     if err then
         return {err}
@@ -95,7 +98,7 @@ function _V.validate(ctx)
     end
 
     if not next(cache) then
-        local params, p_err = httpd.openapi:form_params(req_path, method, ctype)
+        local params, p_err = schema:form_params(req_path, method, ctype)
 
         if p_err then
             error(p_err)
@@ -470,9 +473,10 @@ function mt:__call(httpd, router, spec_conf, options)
     if schemas.secondary.__extend then
         join_schemas(schemas.primary, schemas.secondary.__extend, "paths")
         join_schemas(schemas.primary, schemas.secondary.__extend, "components")
-    end
 
-    -- TODO handle secondary schemas with path here
+        -- delete __extend schema, it's redundant at this point
+        schemas.secondary.__extend = nil
+    end
 
     local openapi = self:new(schemas.primary)
 
@@ -522,6 +526,31 @@ function mt:__call(httpd, router, spec_conf, options)
 
         rawset(httpd.options, k, v)
     end
+
+
+    local secondary_routes = {}
+    if schemas.secondary then
+        secondary_routes = fun.reduce(
+            function(res, base_path, schema_opts)
+                local uid = uuid.str()
+                local _schema = self:new(schema_opts, base_path, uid)
+
+                local _paths  = _schema:parse_paths()
+                httpd.openapi:add_schema(uid, _schema)
+
+                table.insert(res, _paths)
+                return res
+            end,
+            {},
+            schemas.secondary
+        )
+
+        if next(secondary_routes) then
+            secondary_routes = unpack(secondary_routes)
+        end
+    end
+
+    routes = fun.chain(routes, secondary_routes):totable()
 
     for _, v in next, routes do
         if v.options.security or httpd.openapi.global_security then
@@ -582,8 +611,23 @@ end
 setmetatable(_M, mt)
 
 -- main openapi handler prototype
-function _M:new(spec)
+function _M:new(spec, base_path, uid_schema)
     local obj = spec or {}
+    obj.server_settings = {
+        path = base_path
+    }
+    obj.uid_schema = uid_schema
+
+    -- just some inner paths to bind child schemas
+    function self:add_schema(uid, secondary_schema)
+        self.__sschemas = self.__sschemas or {}
+
+        rawset(self.__sschemas, uid, secondary_schema)
+    end
+
+    function self:get_secondary(uid)
+        return self.__sschemas[uid]
+    end
 
     function self:read_server()
         if not self.servers then
@@ -656,60 +700,75 @@ function _M:new(spec)
     end
 
     function self:parse_paths()
-        local result = {}
-        for path, methods in next, self.paths do
-            fun.map(
-                function(method, opts)
-                    local options = table.deepcopy(opts)
-                    options.method = method
-                    options.path = path
-                    return options
-                end,
-                methods
-            ):reduce(
-                function(res, opts)
-                    opts.tags = opts.tags or {"default"}
+        local parsed = {}
+        fun.reduce(
+            function(_r, path, methods)
+                fun.map(
+                    function(method, opts)
+                        local options = table.deepcopy(opts)
+                        options.method = method
+                        path = self.base_path and fio.pathjoin(self.base_path, path) or path
+                        return options
+                    end,
+                    methods
+                )  :reduce(
+                    function(res, opts)
+                        opts.tags = opts.tags or { "default" }
 
-                    -- gets the first tag from value
-                    local _, tag = next(opts.tags)
-                    local method = opts.method:upper()
-                    if not tag then
+                        -- gets the first tag from value
+                        local _, tag = next(opts.tags)
+                        local method = opts.method:upper()
+                        if not tag then
+                            return res
+                        end
+
+                        local controller = tag
+                        if opts.operationId then
+                            controller = ("%s#%s"):format(tag, opts.operationId)
+                        end
+
+                        local auth = opts.security and self:parse_security_schemes(opts.security) or nil
+
+                        -- set fullPath option for secondary schemas with path option set
+                        if self.base_path then
+                            opts['x-settings'] = opts['x-settings'] or {}
+                            opts['x-settings'].fullPath = true
+                        end
+
+                        local _path = self:form_path(
+                            path,
+                            method
+                        )
+
+                        table.insert(res, {
+                            options = {
+                                settings = opts['x-settings'],
+                                method = method,
+                                path = util.parse_path(_path),
+                                openapi_path = path,
+                                uid_schema = uid_schema,
+                                security = auth
+                            },
+                            controller = controller
+                        })
                         return res
-                    end
+                    end,
+                    parsed
+                )
 
-                    local controller = tag
-                    if opts.operationId then
-                        controller = ("%s#%s"):format(tag, opts.operationId)
-                    end
+                rawset(_r, path, methods)
 
-                    local auth = opts.security and self:parse_security_schemes(opts.security) or nil
-
-                    local _path = self:form_path(
-                        path,
-                        method
-                    )
-
-                    table.insert(res, {
-                        options = {
-                            settings     = opts['x-settings'],
-                            method       = method,
-                            path         = util.parse_path(_path),
-                            openapi_path = path,
-                            security     = auth
-                        },
-                        controller = controller
-                    })
-                    return res
-                end,
-                result
-            )
-        end
+                return _r
+            end,
+            self.paths,
+            self.paths
+        )
 
         if self.security then
             self.global_security = self:parse_security_schemes(self.security)
         end
 
-        return result
+        return parsed
     end
 
     function self:parse_security_schemes(scheme)
@@ -721,7 +780,7 @@ function _M:new(spec)
 
         local key, scope = next(v)
         local options
-        if self.components.securitySchemes then
+        if self.components and self.components.securitySchemes then
             options = self.components.securitySchemes[key]
             if not options then
                 error(
@@ -868,7 +927,7 @@ function _M:new(spec)
 
         local settings = opts[method]['x-settings'] or {}
 
-        if self.server_settings.path and not settings.fullPath then
+        if self.server_settings and self.server_settings.path and not settings.fullPath then
             local res = self.join_path(self.server_settings.path, unpack(relpath:split("/")))
             return res
         end
@@ -1268,6 +1327,15 @@ function _U.bind_security(ctx)
         end
 
         if auth_handler then
+            if not security.options and ctx.endpoint.uid_schema then
+                local _s  = httpd.openapi:get_secondary(ctx.endpoint.uid_schema)
+                local _ps = assert(_s.paths[ctx.endpoint.openapi_path], "path unknown")
+                local _ms = assert(_ps[ctx.endpoint.method:lower()], "unknown method")
+
+                ctx.endpoint.security = httpd.openapi:parse_security_schemes(_ms.security)
+                security = ctx.endpoint.security
+            end
+
             local scheme = security.options.scheme or security.options.type
             local auth_data, additional = _U[scheme](ctx, security.options.name, security.options['in'])
             if not auth_data then
