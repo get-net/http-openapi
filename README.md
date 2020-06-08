@@ -288,11 +288,11 @@ local schema_options = {
    primary_schema    = "base.yaml",
    secondary_schemas = {
        {
-           schema = "v2.yaml",
-           path = "/api/v1.0",
+           schema = "api_v2.yaml",
+           path = "/api/v2",
        },
        {
-           schema = "v3.yaml"
+           schema = "api_v3.yaml"
        }
    }
 }
@@ -320,6 +320,30 @@ paths and components will be taken
 * **path** — is a prefix to all the paths, described in current schema. If this option is not set, this file will simply extend the primary schema.
 Please note, that if there's a global path option set in primary schema, it'll also be applied to this one's paths. 
  
+ 
+ You may also set new schema without changing the old-way options, just by calling a couple of new methods:
+ ```lua
+-- app.lua file
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+     "schema.yaml",
+    {
+        security = require("authorization")
+    }
+)
+
+--[[ 
+    the first argument is the path to the schema file to read
+    the second one is actually a base_path option from before.
+    this calls will add new secondary schemas inside of openapi object
+]]
+app.openapi:add_schema("./schemas/api_v2.yaml", "/api/v2")
+app.openapi:add_schema("./schemas/api_v3.yaml")
+
+-- calling this method will automatically set new routes to server object
+app:bind_paths()
+```
  
  ## Route settings
  There are additional tweaks for a single path object, that are set in a special option, called **x-settings**. For example,

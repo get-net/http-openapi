@@ -410,7 +410,7 @@ local function join_schemas(primary, secondary, field )
 
     primary[field] = fun.reduce(
         function(res, k ,v)
-            -- do not override primary options with secondary ones
+            -- does not override primary options with secondary ones
             if not res[k] then
                 rawset(res, k ,v)
             end
@@ -422,135 +422,31 @@ local function join_schemas(primary, secondary, field )
     )
 end
 
-local function read_spec(spec_conf)
-    local conf = {}
+local function bind_routes(httpd)
+    local router = httpd:router()
 
-    if type(spec_conf) == "table" then
-        assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
+    local routes = httpd.openapi:parse_paths()
 
-        assert(spec_conf.base_path, "base_path option is not set")
-        assert(spec_conf.primary_schema, "primary_schema option is not set")
-
-        conf.primary = read_specfile(fio.pathjoin(spec_conf.base_path, spec_conf.primary_schema))
-
-        conf.secondary = {}
-
-        spec_conf.secondary_schemas = spec_conf.secondary_schemas or {}
-
-        for _, opts in next, spec_conf.secondary_schemas do
-            local _s = read_specfile(fio.pathjoin(spec_conf.base_path, opts.schema))
-
-            --[[
-                set internal option __extend for schemas that don't have their own distictive path option
-                those would be inserted into primary schema afterwards
-            ]]
-            opts.path = opts.path or "__extend"
-
-            if conf.secondary[opts.path] then
-                join_schemas(conf.secondary[opts.path], _s, "paths")
-                join_schemas(conf.secondary[opts.path], _s, "components")
-            else
-                rawset(conf.secondary, opts.path, _s)
-            end
-        end
-    end
-
-    if type(spec_conf) == "string" then
-        conf.primary = read_specfile(spec_conf)
-    end
-
-    return conf
-end
-
-function mt:__call(httpd, router, spec_conf, options)
-    local schemas = read_spec(spec_conf)
-
-    if not app_config then
-        util.read_config()
-    end
-
-    -- we'll consider those as a part of the primary schema
-    if schemas.secondary.__extend then
-        join_schemas(schemas.primary, schemas.secondary.__extend, "paths")
-        join_schemas(schemas.primary, schemas.secondary.__extend, "components")
-
-        -- delete __extend schema, it's redundant at this point
-        schemas.secondary.__extend = nil
-    end
-
-    local openapi = self:new(schemas.primary)
-
-    local server_settings = openapi:read_server()
-
-    if not server_settings.socket then
-        -- overrides server settings from openapi schema sets 8080 as a default port if not set
-        httpd = httpd.new(server_settings.host, server_settings.port or 8080, app_config.server_options)
-    else
-        local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
-            server_settings.socket
-        httpd = httpd.new("unix/", out_port, app_config.server_options)
-    end
-
-    httpd.openapi = openapi
-    httpd.openapi.server_settings = server_settings or {}
-
-    local routes = openapi:parse_paths()
-
-    router = router.new(app_config.server)
-
-    httpd:set_router(router)
-
-    for k, v in next, options do
-        if k == "cors" then
-            assert(type(v) == "table", "CORS option must be a table")
-            local _cors = default_cors
-
-            for key, val in next, v do
-                if not default_cors[key] then
-                    error(("Unsupported CORS option %s"):format(key))
-                end
-
-                if type(val) ~= type(default_cors[key]) then
-                    local msg = ("Invalid type for option %s. Expected %s got %s"):format(
-                        k,
-                        type(default_cors[key]),
-                        type(v)
-                    )
-                    error(msg)
-                end
-                rawset(_cors, key, val)
-            end
-
-            v = _cors
-        end
-
-        rawset(httpd.options, k, v)
-    end
-
-
-    local secondary_routes = {}
-    if schemas.secondary then
-        secondary_routes = fun.reduce(
-            function(res, base_path, schema_opts)
-                local uid = uuid.str()
-                local _schema = self:new(schema_opts, base_path, uid)
-
-                local _paths  = _schema:parse_paths()
-                httpd.openapi:add_schema(uid, _schema)
+    if httpd.openapi.__sschemas then
+        -- set additional routes from secondary schemas and bind them
+        local additional_routes = fun.reduce(
+            function(res, _, _schema)
+                local _paths  = _schema:parse_paths(uid)
 
                 table.insert(res, _paths)
+                _schema.bound = true
                 return res
             end,
             {},
-            schemas.secondary
+            httpd.openapi.__sschemas
         )
 
-        if next(secondary_routes) then
-            secondary_routes = unpack(secondary_routes)
+        if next(additional_routes) then
+            routes = fun.chain(routes, unpack(additional_routes)):totable()
         end
-    end
 
-    routes = fun.chain(routes, secondary_routes):totable()
+        httpd.openapi.bound = true
+    end
 
     for _, v in next, routes do
         if v.options.security or httpd.openapi.global_security then
@@ -589,6 +485,80 @@ function mt:__call(httpd, router, spec_conf, options)
 
         router:route(v.options, v.controller)
     end
+end
+
+function mt:__call(httpd, router, spec_conf, options)
+    local openapi
+    if not app_config then
+        util.read_config()
+    end
+
+    if type(spec_conf) == "string" then
+        openapi = self:new(read_specfile(spec_conf))
+    end
+
+    if type(spec_conf) == "table" then
+        assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
+
+        local base_path = assert(spec_conf.base_path, "base_path option is not set")
+        local primary = assert(spec_conf.primary_schema, "primary_schema option is not set")
+        local secondary_schemas = spec_conf.secondary_schemas or {}
+
+        openapi = self:new(read_specfile(fio.pathjoin(base_path, primary)))
+
+        for _, opts in next, secondary_schemas do
+            openapi:add_schema(fio.pathjoin(base_path, opts.schema), opts.path)
+        end
+    end
+
+    local server_settings = openapi:read_server()
+
+    if not server_settings.socket then
+        -- overrides server settings from openapi schema sets 8080 as a default port if not set
+        httpd = httpd.new(server_settings.host, server_settings.port or 8080, app_config.server_options)
+    else
+        local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
+            server_settings.socket
+        httpd = httpd.new("unix/", out_port, app_config.server_options)
+    end
+
+    httpd.openapi = openapi
+    httpd.openapi.server_settings = server_settings or {}
+
+    router = router.new(app_config.server)
+
+    httpd:set_router(router)
+
+    for k, v in next, options do
+        if k == "cors" then
+            assert(type(v) == "table", "CORS option must be a table")
+            local _cors = default_cors
+
+            for key, val in next, v do
+                if not default_cors[key] then
+                    error(("Unsupported CORS option %s"):format(key))
+                end
+
+                if type(val) ~= type(default_cors[key]) then
+                    local msg = ("Invalid type for option %s. Expected %s got %s"):format(
+                        k,
+                        type(default_cors[key]),
+                        type(v)
+                    )
+                    error(msg)
+                end
+                rawset(_cors, key, val)
+            end
+
+            v = _cors
+        end
+
+        rawset(httpd.options, k, v)
+    end
+
+    httpd.bind_paths = bind_routes
+
+    httpd:bind_paths()
 
     if options.metrics then
         _P.bind_metrics(httpd)
@@ -617,90 +587,109 @@ function _M:new(spec, base_path, uid_schema)
         path = base_path
     }
     obj.uid_schema = uid_schema
+    obj.bound      = false
 
-    -- just some inner paths to bind child schemas
-    function self:add_schema(uid, secondary_schema)
-        self.__sschemas = self.__sschemas or {}
+    if not base_path and not uid_schema then
+        -- just some inner paths to bind child schemas
+        function self:add_schema(filepath, _path)
+            local _schema = read_specfile(filepath)
 
-        rawset(self.__sschemas, uid, secondary_schema)
-    end
+            if not _path then
+                join_schemas(self, _schema, "paths")
+                join_schemas(self, _schema, "components")
+                return
+            end
 
-    function self:get_secondary(uid)
-        return self.__sschemas[uid]
-    end
+            -- generate uid for secondary schema
+            local uid = uuid.str()
+            self.__sschemas = self.__sschemas or {}
 
-    function self:read_server()
-        if not self.servers then
-            return {}
+            local _obj = _M:new(_schema, _path, uid)
+            rawset(self.__sschemas, uid, _obj)
         end
 
-        -- form server settings and unfold variables object
-        local current = fun.filter(
-            function(val)
-                if app_config.is_test then
-                    return val.description == "test"
-                end
-                return val.description == app_config.__name
-            end,
-            self.servers
-        ):map(
-            function(val)
-                local server_params = util.read_path_parameters(val.url)
+        function self:get_secondary(uid)
+            return self.__sschemas[uid]
+        end
 
-                if next(server_params) and not val.variables then
-                    error(("Server variables are not set for %q environment: %s"):format(app_config.__name, val.url))
-                end
+        function self:read_server()
+            if not self.servers then
+                return {}
+            end
 
-                local parsed_url
-                if val.variables then
-                    val.variables = fun.map(
-                        function(k, v)
-                            return k, v.default
-                        end,
-                        val.variables
-                    ):tomap()
+            -- form server settings and unfold variables object
+            local current = fun.filter(
+                function(val)
+                    if app_config.is_test then
+                        return val.description == "test"
+                    end
+                    return val.description == app_config.__name
+                end,
+                self.servers
+            ):map(
+                function(val)
+                    local server_params = util.read_path_parameters(val.url)
 
-                    for _, param in next, server_params do
-                        local pattern = ("{%s}"):format(param)
-                        local value = assert(
-                            val.variables[param],
-                            ("Variable %q is not set for %s server options"):format(param, app_config.__name)
-                        )
-
-                        value = value:strip("/")
-
-                        val.url = val.url:gsub(pattern, value)
+                    if next(server_params) and not val.variables then
+                        error(("Server variables are not set for %q environment: %s"):format(app_config.__name, val.url))
                     end
 
-                    parsed_url = neturl.parse(val.url)
+                    local parsed_url
+                    if val.variables then
+                        val.variables = fun.map(
+                            function(k, v)
+                                return k, v.default
+                            end,
+                            val.variables
+                        ):tomap()
 
-                    parsed_url = fun.reduce(
-                        function(r, k, v)
-                            r[k] = v
-                            return r
-                        end,
-                        parsed_url,
-                        val.variables
-                    )
-                else
-                    parsed_url = neturl.parse(val.url)
+                        for _, param in next, server_params do
+                            local pattern = ("{%s}"):format(param)
+                            local value = assert(
+                                val.variables[param],
+                                ("Variable %q is not set for %s server options"):format(param, app_config.__name)
+                            )
+
+                            value = value:strip("/")
+
+                            val.url = val.url:gsub(pattern, value)
+                        end
+
+                        parsed_url = neturl.parse(val.url)
+
+                        parsed_url = fun.reduce(
+                            function(r, k, v)
+                                r[k] = v
+                                return r
+                            end,
+                            parsed_url,
+                            val.variables
+                        )
+                    else
+                        parsed_url = neturl.parse(val.url)
+                    end
+
+                    return parsed_url
                 end
+            ):totable()
 
-                return parsed_url
+            local _, settings = next(current)
+
+            if not settings then
+                error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
             end
-        ):totable()
 
-        local _, settings = next(current)
-
-        if not settings then
-            error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
+            return settings
         end
-
-        return settings
     end
 
     function self:parse_paths()
         local parsed = {}
+
+        if self.bound then
+            return parsed
+        end
+
         fun.reduce(
             function(_r, path, methods)
                 fun.map(
@@ -711,7 +700,7 @@ function _M:new(spec, base_path, uid_schema)
                         return options
                     end,
                     methods
-                )  :reduce(
+                ):reduce(
                     function(res, opts)
                         opts.tags = opts.tags or { "default" }
 
@@ -746,7 +735,7 @@ function _M:new(spec, base_path, uid_schema)
                                 method = method,
                                 path = util.parse_path(_path),
                                 openapi_path = path,
-                                uid_schema = uid_schema,
+                                uid_schema = self.uid_schema,
                                 security = auth
                             },
                             controller = controller
