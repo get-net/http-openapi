@@ -384,6 +384,7 @@ local function read_specfile(filepath)
         ("Spec file %s does not exist"):format(filepath)
     )
 
+    print("hi there")
     local tab = filepath:split(".")
     local ext = tab[#tab]
     assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
@@ -493,11 +494,12 @@ function mt:__call(httpd, router, spec_conf, options)
         util.read_config()
     end
 
+    local server_settings
     if type(spec_conf) == "string" then
         openapi = self:new(read_specfile(spec_conf))
+        server_settings = openapi:read_server()
     end
 
-    local server_settings
     if type(spec_conf) == "table" then
         assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
 
