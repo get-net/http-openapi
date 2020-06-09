@@ -210,8 +210,77 @@ function _V.validate_query(ctx, spec, res)
     )
 end
 
+function _V.array(t, spec, ctx)
+    local first_run = (_V.runs == 0)
+
+    if type(t) ~= "table" or _V.is_object(t) then
+        return first_run and {
+            details = {
+                error    = "invalid",
+                expected = "array",
+                actual   = type(t)
+            }
+        } or false
+    end
+
+    spec = spec.items
+    local pkey, pval = next(spec)
+
+    if pkey == "$ref" then
+        local httpd = ctx['tarantool.http.httpd']
+        local uid_schema = ctx.endpoint.uid_schema
+
+        local reference = httpd.openapi:ref(pval, uid_schema)
+        if reference then
+            spec = reference
+            required = reference.required or {}
+        end
+    end
+
+    local res = fun.reduce(
+        function(res, val)
+            local ptype = spec.format or spec.type
+
+            local r
+            if ptype == "object" then
+                r = _V[ptype](val, spec, ctx)
+            else
+                r = _V[ptype](val)
+            end
+
+            if not r then
+                table.insert(res, _V.p_error("invalid", ptype, type(val)))
+                return res
+            end
+
+            if type(r) == "table" and next(r) then
+                if not _V.is_object(r) then
+                    table.insert(res, r)
+                    return res
+                end
+
+                local _t = {}
+                for k, v in next, r do
+                    rawset(_t, k, v)
+                end
+                table.insert(res, _t)
+            end
+
+            return res
+        end,
+        {},
+        t
+    )
+
+    return res
+end
+
 function _V.object(val, spec, ctx)
     if not _V.is_object(val) then
+        if type(val) ~= "table" then
+            return _V.p_error("invalid", "object", type(val))
+        end
+
         -- in case of no actual parameters and no required ones
         if not next(val) and not spec.required then
             return {}
@@ -230,7 +299,10 @@ function _V.object(val, spec, ctx)
             local k, v = next(param)
             if k == "$ref" then
                 local httpd = ctx['tarantool.http.httpd']
-                local reference = httpd.openapi:ref(v)
+                local uid_schema = ctx.endpoint.uid_schema
+
+                -- fetches secondary schema's refs
+                local reference = httpd.openapi:ref(v, uid_schema)
                 if reference then
                     param = reference
                     required = reference.required or {}
@@ -330,22 +402,6 @@ end
 function _V.uuid(str)
     local s, res = pcall(uuid.fromstr, str)
     return s and res ~= nil
-end
-
-function _V.array(t, param)
-    local first_run = (_V.runs == 0)
-    -- a clumsy hack
-    if type(t) ~= "table" or _V.is_object(t) then
-        return first_run and {
-            details = {
-                error    = "invalid",
-                expected = "array",
-                actual   = type(param)
-            }
-        } or false
-    end
-
-    return {}
 end
 
 function _V.enum(val, options)
@@ -872,7 +928,13 @@ function _M:new(spec, base_path, uid_schema)
         return result
     end
 
-    function self:ref(str)
+    function self:ref(str, uid)
+        if uid then
+            local _schema = self:get_secondary(uid)
+
+            return _schema:ref(str)
+        end
+
         local pathtab = str:match("#%/(.+)"):split("/")
         return fun.reduce(
             function(res, v)
