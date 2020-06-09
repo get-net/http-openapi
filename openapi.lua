@@ -497,6 +497,7 @@ function mt:__call(httpd, router, spec_conf, options)
         openapi = self:new(read_specfile(spec_conf))
     end
 
+    local server_settings
     if type(spec_conf) == "table" then
         assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
 
@@ -506,12 +507,13 @@ function mt:__call(httpd, router, spec_conf, options)
 
         openapi = self:new(read_specfile(fio.pathjoin(base_path, primary)))
 
+        -- moved this call here to have a possibility of setting relative schemas
+        server_settings = openapi:read_server()
+
         for _, opts in next, secondary_schemas do
-            openapi:add_schema(fio.pathjoin(base_path, opts.schema), opts.path)
+            openapi:add_schema(fio.pathjoin(base_path, opts.schema), opts.path, opts.relative)
         end
     end
-
-    local server_settings = openapi:read_server()
 
     if not server_settings.socket then
         -- overrides server settings from openapi schema sets 8080 as a default port if not set
@@ -523,7 +525,6 @@ function mt:__call(httpd, router, spec_conf, options)
     end
 
     httpd.openapi = openapi
-    httpd.openapi.server_settings = server_settings or {}
 
     router = router.new(app_config.server)
 
@@ -589,9 +590,13 @@ function _M:new(spec, base_path, uid_schema)
     obj.uid_schema = uid_schema
     obj.bound      = false
 
+    --[[
+        those methods set only for primary schema, setting secondary schemas to secondary schemas
+        might cause some painful nesting for now
+    ]]
     if not base_path and not uid_schema then
         -- just some inner paths to bind child schemas
-        function self:add_schema(filepath, _path)
+        function self:add_schema(filepath, _path, relative)
             local _schema = read_specfile(filepath)
 
             if not _path then
@@ -603,6 +608,12 @@ function _M:new(spec, base_path, uid_schema)
             -- generate uid for secondary schema
             local uid = uuid.str()
             self.__sschemas = self.__sschemas or {}
+
+            if relative then
+                if self.server_settings and self.server_settings.path then
+                    _path = fio.pathjoin(self.server_settings.path, _path)
+                end
+            end
 
             local _obj = _M:new(_schema, _path, uid)
             rawset(self.__sschemas, uid, _obj)
@@ -678,6 +689,8 @@ function _M:new(spec, base_path, uid_schema)
             if not settings then
                 error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
             end
+
+            self.server_settings = settings
 
             return settings
         end

@@ -291,8 +291,13 @@ local schema_options = {
            schema = "api_v2.yaml",
            path = "/api/v2",
        },
-       {
+       { 
            schema = "api_v3.yaml"
+       },
+       {
+           schema = "relative.yaml",
+           path   = "/relative",
+           relative = true        
        }
    }
 }
@@ -318,7 +323,9 @@ paths and components will be taken
 * **secondary_schemas** — a list of additional schemas, in this case a v2 and v3 of our API.
 * **schema** — in secondary_schemas is a name of a file relative to our **base_path** option, i.e **./schemas/v2.yaml** and **./schemas/v3.yaml** in this case.
 * **path** — is a prefix to all the paths, described in current schema. If this option is not set, this file will simply extend the primary schema.
-Please note, that if there's a global path option set in primary schema, it'll also be applied to this one's paths. 
+Please note, that if there's a global path option set in primary schema, it'll also be applied to this one's paths.
+* **relative** - is and option that idicates, that given schema paths would be relative to primary ones, i.e. the primary
+schema's base_path would be a prefix to every path withing this schema
  
  
  You may also set new schema without changing the old-way options, just by calling a couple of new methods:
