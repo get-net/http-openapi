@@ -384,7 +384,6 @@ local function read_specfile(filepath)
         ("Spec file %s does not exist"):format(filepath)
     )
 
-    print("hi there")
     local tab = filepath:split(".")
     local ext = tab[#tab]
     assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
