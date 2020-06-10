@@ -339,7 +339,7 @@ function _V.object(val, spec, ctx)
             if ptype == "object" then
                 r = _V[ptype](val[key], obj[key], ctx)
             else
-                r = _V[ptype](param)
+                r = _V[ptype](param, ctx)
             end
             if not r then
                 rawset(res, key, _V.p_error("invalid", ptype, type(param)))
@@ -423,6 +423,37 @@ _V['date-time'] = function(str)
     local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
     return ok ~= nil
 end
+
+-- template for filetype validation
+local fileformat = {
+    type     = "object",
+    required = {"data"},
+    properties = {
+        data = {
+            type = "string"
+        },
+        headers = {
+            type = "object",
+            properties = {
+                filename = {
+                    type = "string"
+                },
+                name = {
+                    type = "string"
+                }
+            }
+        },
+        mime = {
+            type = "string"
+        }
+    }
+}
+
+function _V.binary(obj, ctx)
+    return _V.object(obj, fileformat, ctx)
+end
+
+_V.byte = _V.binary
 
 function _V.p_error(alias, expected, actual)
     return {

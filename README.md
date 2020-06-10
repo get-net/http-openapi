@@ -243,37 +243,48 @@ app:bad_request_handler(
 
 ## Describing multipart/form-data request
 
-You'll need to describe the operation object's schema properly so that request validation won't fail.
-This is a standard format of **multipart/form-data** request
+OpenAPI specification has two options to describe a file parameter for now:
 
 ```yaml
-post:
-  tags:
-    - main
-  operationId: 'multipart'
-  requestBody:
-    content:
-      multipart/form-data:
-        schema:
-          type: object
-          properties:
-            id:
-              type: string
-            file:
-              type: object
-              properties:
-                data:
-                  type: string
-                mime:
-                  type: string
-                headers:
-                  type: object
-                  properties:
-                    filename:
-                      type: string
-                    name:
-                      type: string
+# this one is for raw binary file data
+/upload/binary:
+  post:
+    tags:
+      - main
+    operationId: 'upload_binary'
+    requestBody:
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            properties:
+              file:
+                type: string
+                format: binary
+
+# this one is for base64-encoded binary
+/upload/bytes:
+  post:
+    tags:
+      - main
+    operationId: 'upload_bytes'
+    requestBody:
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            properties:
+              file:
+                type: string
+                format: bytes
 ```
+
+Take note, that inside of an openapi validator, the *bytes* and *binary* formats are actually treated
+as an object and not a string value. So, inside of a controller function the **file** parameter will be a table containing:
+
+* **data** — binary file content
+* **headers** — file headers, containing *filename* and *name* which are: actual file name(~duh) and parameter name accordingly
+* **mime** — a mime type of the file: image/jpeg, image/png etc. 
 
 ## API versioning
 There's a possibility to pass multiple schemas to the openapi object constructor function. It's primarily aimed to add
