@@ -28,31 +28,9 @@ local json, tap
 local default_cors = {
     max_age = 3600,
     allow_credentials = true,
-    allow_headers = {"Authorization, Content-Type"},
-    allow_origin = {"*"}
+    allow_headers = { "Authorization, Content-Type" },
+    allow_origin = { "*" }
 }
-
-local function read_spec(spec_path)
-    assert(
-        fio.path.is_file(spec_path),
-        ("Spec file %s does not exist"):format(spec_path)
-    )
-
-    local tab = spec_path:split(".")
-    local ext = tab[#tab]
-    assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
-    local decoder = require(ext)
-    local file = fio.open(spec_path, {"O_RDONLY"})
-
-    local data = file:read()
-    local status, res = pcall(decoder.decode, data)
-    assert(
-        status,
-        ("Specification file %s is not valid"):format(spec_path)
-    )
-
-    return res
-end
 
 local _M = {}
 local _P = {}
@@ -61,58 +39,500 @@ local _U = {}
 local _T = {}
 local mt = {}
 
-function mt:__call(httpd, router, spec_path, options)
-    local openapi = self:new(read_spec(spec_path))
+-- validation functions
+function _V.validate(ctx)
+    local c, a = ctx.endpoint.controller, ctx.endpoint.action
 
-    if not app_config then
-        util.read_config()
+    local ctype = ctx:header("content-type")
+    local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
+
+    if not req_path then
+        return
     end
 
-    local server_settings = openapi:read_server()
+    if ctype then
+        local with_charset = ctype:match("(%S+)[;]:?")
 
-    if not server_settings.socket then
-        -- overrides server settings from openapi schema sets 8080 as a default port if not set
-        httpd = httpd.new(server_settings.host, server_settings.port or 8080, app_config.server_options)
-    else
-        local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
-            server_settings.socket
-        httpd = httpd.new("unix/", out_port, app_config.server_options)
+        if with_charset then
+            ctype = with_charset
+        end
     end
 
-    httpd.openapi = openapi
-    httpd.openapi.server_settings = server_settings or {}
+    local httpd = ctx['tarantool.http.httpd']
 
-    local routes = openapi:parse_paths()
+    local schema = ctx.endpoint.uid_schema and
+        httpd.openapi:get_secondary(ctx.endpoint.uid_schema) or httpd.openapi
 
-    router = router.new(app_config.server)
+    local has, err = schema:has_params(req_path, method, ctype)
 
-    httpd:set_router(router)
+    if err then
+        return {err}
+    end
 
-    for k, v in next, options do
-        if k == "cors" then
-            assert(type(v) == "table", "CORS option must be a table")
-            local _cors = default_cors
+    if not has then
+        return {}
+    end
 
-            for key, val in next, v do
-                if not default_cors[key] then
-                    error(("Unsupported CORS option %s"):format(key))
-                end
+    httpd.cache = httpd.cache or {}
 
-                if type(val) ~= type(default_cors[key]) then
-                    local msg = ("Invalid type for option %s. Expected %s got %s"):format(
-                        k,
-                        type(default_cors[key]),
-                        type(v)
-                    )
-                    error(msg)
-                end
-                rawset(_cors, key, val)
-            end
+    if not httpd.cache.params then
+        httpd.cache.params = {}
+    end
 
-            v = _cors
+    local cache = httpd.cache.params[c]
+
+    if not cache then
+        httpd.cache.params[c] = {}
+    end
+
+    cache = not a and cache or httpd.cache.params[c][a]
+
+    if not cache then
+        if a then
+            httpd.cache.params[c][a] = {}
+            cache = httpd.cache.params[c][a]
+        else
+            httpd.cache.params[c] = {}
+            cache = httpd.cache.params[c]
+        end
+    end
+
+    if not next(cache) then
+        local params, p_err = schema:form_params(req_path, method, ctype)
+
+        if p_err then
+            error(p_err)
         end
 
-        rawset(httpd.options, k, v)
+        if action then
+            httpd.cache.params[c][a] = params
+        else
+            httpd.cache.params[c] = params
+        end
+        cache = params
+    end
+
+    local res = {}
+
+    if method ~= "get" and cache._body then
+        local post = ctx:post_param()
+
+        _V.runs = 0
+        if cache._body then
+            --[[
+                ctx arg goes last as optional, 'cause this call may execute
+                object validation as well as string or an array validation
+            ]]
+
+            if cache._body.type then
+                res = _V[cache._body.type](post, cache._body, ctx)
+            end
+
+            if _V.runs <= 0 then
+                res = next(res) and {body = res} or res
+            end
+        end
+    end
+
+    _V.validate_query(ctx, cache._query, res)
+    return res or {}
+end
+
+function _V.validate_query(ctx, spec, res)
+    local query = ctx:query_param()
+    local stash = ctx.endpoint.stash
+
+    if next(stash) then
+        stash = fun.map(
+            function(name)
+                return name, stash[name]
+            end,
+            stash
+        ):tomap()
+    end
+
+    if not next(spec) and (next(query) or next(stash)) then
+        return fun.chain(query, stash):reduce(
+            function(_res, key)
+                _res[key] =_V.p_error("unknown")
+                return _res
+            end,
+            res
+        )
+    else
+        fun.chain(query, stash):reduce(
+            function(_res, key)
+                if not fun.any(function(val) return val.name == key end, spec) then
+                    _res[key] = _V.p_error("unknown")
+                end
+                return _res
+            end,
+            res
+        )
+    end
+
+    return fun.reduce(
+        function(_res, param)
+            local value
+            if param['in'] == "query" then
+                value = query[param.name]
+            elseif param['in'] == "path" then
+                value = stash[param.name]
+            end
+
+            if value == nil and not param.required then
+                return _res
+            end
+
+            if not value then
+                _res[param.name] = _V.p_error("missing")
+                return _res
+            end
+
+            local vtype = param.schema.format or param.schema.type
+
+            if not _V[vtype](value) then
+                _res[param.name] = _V.p_error("invalid", vtype, type(value))
+            end
+
+            if param.schema.enum then
+                local ok = _V.enum(value, param.schema.enum)
+
+                if not ok and not param.schema.nullable then
+                    _res[param.name] = _V.p_error("invalid", param.schema.enum, value)
+                end
+            end
+
+            return _res
+        end,
+        res,
+        spec
+    )
+end
+
+function _V.array(t, spec, ctx)
+    local first_run = (_V.runs == 0)
+
+    if type(t) ~= "table" or _V.is_object(t) then
+        return first_run and {
+            details = {
+                error    = "invalid",
+                expected = "array",
+                actual   = type(t)
+            }
+        } or false
+    end
+
+    spec = spec.items
+    local pkey, pval = next(spec)
+
+    if pkey == "$ref" then
+        local httpd = ctx['tarantool.http.httpd']
+        local uid_schema = ctx.endpoint.uid_schema
+
+        local reference = httpd.openapi:ref(pval, uid_schema)
+        if reference then
+            spec = reference
+            required = reference.required or {}
+        end
+    end
+
+    local res = fun.reduce(
+        function(res, val)
+            local ptype = spec.format or spec.type
+
+            local r
+            if ptype == "object" then
+                r = _V[ptype](val, spec, ctx)
+            else
+                r = _V[ptype](val)
+            end
+
+            if not r then
+                table.insert(res, _V.p_error("invalid", ptype, type(val)))
+                return res
+            end
+
+            if type(r) == "table" and next(r) then
+                if not _V.is_object(r) then
+                    table.insert(res, r)
+                    return res
+                end
+
+                local _t = {}
+                for k, v in next, r do
+                    rawset(_t, k, v)
+                end
+                table.insert(res, _t)
+            end
+
+            return res
+        end,
+        {},
+        t
+    )
+
+    return res
+end
+
+function _V.object(val, spec, ctx)
+    if not _V.is_object(val) then
+        if type(val) ~= "table" then
+            return _V.p_error("invalid", "object", type(val))
+        end
+
+        -- in case of no actual parameters and no required ones
+        if not next(val) and not spec.required then
+            return {}
+        end
+
+        local first_run = (_V.runs == 0)
+        return first_run and _V.p_error("invalid", "object", type(val)) or false
+    end
+
+    _V.runs = _V.runs + 1
+    local required = spec.required or {}
+    local obj = spec.properties
+
+    local absent = fun.map(
+        function(key, param)
+            local k, v = next(param)
+            if k == "$ref" then
+                local httpd = ctx['tarantool.http.httpd']
+                local uid_schema = ctx.endpoint.uid_schema
+
+                -- fetches secondary schema's refs
+                local reference = httpd.openapi:ref(v, uid_schema)
+                if reference then
+                    param = reference
+                    required = reference.required or {}
+                    obj[key] = param
+                end
+            end
+
+            local is_required = fun.any(
+                function(_v)
+                    return _v == key
+                end,
+                required
+            )
+
+            if is_required and not val[key] then
+                return key, _V.p_error("missing")
+            end
+            return key, nil
+        end,
+        obj
+    ):tomap()
+
+    return fun.reduce(
+        function(res, key, param)
+            if not obj[key] then
+                rawset(res, key, _V.p_error("unknown"))
+                return res
+            end
+
+            local ptype = obj[key].format or obj[key].type
+
+            local r
+
+            if ptype == "object" then
+                r = _V[ptype](val[key], obj[key], ctx)
+            else
+                r = _V[ptype](param, ctx)
+            end
+            if not r then
+                rawset(res, key, _V.p_error("invalid", ptype, type(param)))
+                return res
+            end
+
+            if type(r) == "table" and next(r) then
+                if not _V.is_object(r) then
+                    rawset(res, key, r)
+                    return res
+                end
+
+                local _t = {}
+                for k, v in next, r do
+                    rawset(_t, k, v)
+                end
+                rawset(res, key, _t)
+            end
+
+            return res
+        end,
+        absent,
+        val
+    )
+end
+
+function _V.is_object(obj)
+    if type(obj) ~= "table" then
+        return false
+    end
+    local k, v = next(obj)
+    return type(k) == "string" and v ~= nil
+end
+
+function _V.string(s)
+    return type(s) == "string"
+end
+
+_V.password = _V.string
+_V.byte     = _V.string
+_V.binary   = _V.string
+
+function _V.integer(i)
+    return type(i) == "number"
+end
+
+_V.number = _V.integer
+_V.double = _V.integer
+_V.float  = _V.integer
+_V.int32  = _V.integer
+_V.int64  = _V.integer
+
+function _V.email(email)
+    if not _V.string(email) then
+        return false
+    end
+    return email:match('[(%w+)%p*]+@[%w+%p*]+%.%a+$') ~= nil
+end
+
+function _V.uuid(str)
+    local s, res = pcall(uuid.fromstr, str)
+    return s and res ~= nil
+end
+
+function _V.enum(val, options)
+    return fun.any(function(v) return val == v end, options)
+end
+
+function _V.date(str)
+    -- lua can't match by length in any other way
+    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+    return ok ~= nil
+end
+
+function _V.boolean(val)
+    return val == true or val == false
+end
+
+_V['date-time'] = function(str)
+    -- same here. needs some thinking maybe later
+    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
+    return ok ~= nil
+end
+
+-- template for filetype validation
+local fileformat = {
+    type     = "object",
+    required = {"data"},
+    properties = {
+        data = {
+            type = "string"
+        },
+        headers = {
+            type = "object",
+            properties = {
+                filename = {
+                    type = "string"
+                },
+                name = {
+                    type = "string"
+                }
+            }
+        },
+        mime = {
+            type = "string"
+        }
+    }
+}
+
+function _V.binary(obj, ctx)
+    return _V.object(obj, fileformat, ctx)
+end
+
+_V.byte = _V.binary
+
+function _V.p_error(alias, expected, actual)
+    return {
+        details = {
+            error = alias,
+            expected = expected,
+            actual = actual
+        }
+    }
+end
+
+local function read_specfile(filepath)
+    assert(
+        fio.path.is_file(filepath),
+        ("Spec file %s does not exist"):format(filepath)
+    )
+
+    local tab = filepath:split(".")
+    local ext = tab[#tab]
+    assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
+    local decoder = require(ext)
+    local file = fio.open(filepath, {"O_RDONLY"})
+
+    local data = file:read()
+    local status, res = pcall(decoder.decode, data)
+    assert(
+        status,
+        ("Specification file %s is not valid"):format(filepath)
+    )
+
+    return res
+end
+
+--[[
+    initial primary schema mutation. NOTE: this is not copying
+    it's changes the original schema
+]]
+local function join_schemas(primary, secondary, field )
+    primary[field]   = primary[field] or {}
+    secondary[field] = secondary[field] or {}
+
+    primary[field] = fun.reduce(
+        function(res, k ,v)
+            -- does not override primary options with secondary ones
+            if not res[k] then
+                rawset(res, k ,v)
+            end
+
+            return res
+        end,
+        primary[field],
+        secondary[field]
+    )
+end
+
+local function bind_routes(httpd)
+    local router = httpd:router()
+
+    local routes = httpd.openapi:parse_paths()
+
+    if httpd.openapi.__sschemas then
+        -- set additional routes from secondary schemas and bind them
+        local additional_routes = fun.reduce(
+            function(res, _, _schema)
+                local _paths  = _schema:parse_paths(uid)
+
+                table.insert(res, _paths)
+                _schema.bound = true
+                return res
+            end,
+            {},
+            httpd.openapi.__sschemas
+        )
+
+        if next(additional_routes) then
+            routes = fun.chain(routes, unpack(additional_routes)):totable()
+        end
+
+        httpd.openapi.bound = true
     end
 
     for _, v in next, routes do
@@ -152,6 +572,82 @@ function mt:__call(httpd, router, spec_path, options)
 
         router:route(v.options, v.controller)
     end
+end
+
+function mt:__call(httpd, router, spec_conf, options)
+    local openapi
+    if not app_config then
+        util.read_config()
+    end
+
+    local server_settings
+    if type(spec_conf) == "string" then
+        openapi = self:new(read_specfile(spec_conf))
+        server_settings = openapi:read_server()
+    end
+
+    if type(spec_conf) == "table" then
+        assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
+
+        local base_path = assert(spec_conf.base_path, "base_path option is not set")
+        local primary = assert(spec_conf.primary_schema, "primary_schema option is not set")
+        local secondary_schemas = spec_conf.secondary_schemas or {}
+
+        openapi = self:new(read_specfile(fio.pathjoin(base_path, primary)))
+
+        -- moved this call here to have a possibility of setting relative schemas
+        server_settings = openapi:read_server()
+
+        for _, opts in next, secondary_schemas do
+            openapi:add_schema(fio.pathjoin(base_path, opts.schema), opts.path, opts.relative)
+        end
+    end
+
+    if not server_settings.socket then
+        -- overrides server settings from openapi schema sets 8080 as a default port if not set
+        httpd = httpd.new(server_settings.host, server_settings.port or 8080, app_config.server_options)
+    else
+        local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
+            server_settings.socket
+        httpd = httpd.new("unix/", out_port, app_config.server_options)
+    end
+
+    httpd.openapi = openapi
+
+    router = router.new(app_config.server)
+
+    httpd:set_router(router)
+
+    for k, v in next, options do
+        if k == "cors" then
+            assert(type(v) == "table", "CORS option must be a table")
+            local _cors = default_cors
+
+            for key, val in next, v do
+                if not default_cors[key] then
+                    error(("Unsupported CORS option %s"):format(key))
+                end
+
+                if type(val) ~= type(default_cors[key]) then
+                    local msg = ("Invalid type for option %s. Expected %s got %s"):format(
+                        k,
+                        type(default_cors[key]),
+                        type(v)
+                    )
+                    error(msg)
+                end
+                rawset(_cors, key, val)
+            end
+
+            v = _cors
+        end
+
+        rawset(httpd.options, k, v)
+    end
+
+    httpd.bind_paths = bind_routes
+
+    httpd:bind_paths()
 
     if options.metrics then
         _P.bind_metrics(httpd)
@@ -173,134 +669,196 @@ end
 
 setmetatable(_M, mt)
 
-function _M:new(spec)
+-- main openapi handler prototype
+function _M:new(spec, base_path, uid_schema)
     local obj = spec or {}
+    obj.server_settings = {
+        path = base_path
+    }
+    obj.uid_schema = uid_schema
+    obj.bound      = false
 
-    function self:read_server()
-        if not self.servers then
-            return {}
+    --[[
+        those methods set only for primary schema, setting secondary schemas to secondary schemas
+        might cause some painful nesting for now
+    ]]
+    if not base_path and not uid_schema then
+        -- just some inner paths to bind child schemas
+        function self:add_schema(filepath, _path, relative)
+            local _schema = read_specfile(filepath)
+
+            if not _path then
+                join_schemas(self, _schema, "paths")
+                join_schemas(self, _schema, "components")
+                return
+            end
+
+            -- generate uid for secondary schema
+            local uid = uuid.str()
+            self.__sschemas = self.__sschemas or {}
+
+            if relative then
+                if self.server_settings and self.server_settings.path then
+                    _path = fio.pathjoin(self.server_settings.path, _path)
+                end
+            end
+
+            local _obj = _M:new(_schema, _path, uid)
+            rawset(self.__sschemas, uid, _obj)
         end
 
-        -- form server settings and unfold variables object
-        local current = fun.filter(
-            function(val)
-                if app_config.is_test then
-                    return val.description == "test"
-                end
-                return val.description == app_config.__name
-            end,
-            self.servers
-        ):map(
-            function(val)
-                local server_params = util.read_path_parameters(val.url)
+        function self:get_secondary(uid)
+            return self.__sschemas[uid]
+        end
 
-                if next(server_params) and not val.variables then
-                    error(("Server variables are not set for %q environment: %s"):format(app_config.__name, val.url))
-                end
+        function self:read_server()
+            if not self.servers then
+                return {}
+            end
 
-                local parsed_url
-                if val.variables then
-                    val.variables = fun.map(
-                        function(k, v)
-                            return k, v.default
-                        end,
-                        val.variables
-                    ):tomap()
+            -- form server settings and unfold variables object
+            local current = fun.filter(
+                function(val)
+                    if app_config.is_test then
+                        return val.description == "test"
+                    end
+                    return val.description == app_config.__name
+                end,
+                self.servers
+            ):map(
+                function(val)
+                    local server_params = util.read_path_parameters(val.url)
 
-                    for _, param in next, server_params do
-                        local pattern = ("{%s}"):format(param)
-                        local value = assert(
-                            val.variables[param],
-                            ("Variable %q is not set for %s server options"):format(param, app_config.__name)
-                        )
-
-                        value = value:strip("/")
-
-                        val.url = val.url:gsub(pattern, value)
+                    if next(server_params) and not val.variables then
+                        error(("Server variables are not set for %q environment: %s"):format(app_config.__name, val.url))
                     end
 
-                    parsed_url = neturl.parse(val.url)
+                    local parsed_url
+                    if val.variables then
+                        val.variables = fun.map(
+                            function(k, v)
+                                return k, v.default
+                            end,
+                            val.variables
+                        ):tomap()
 
-                    parsed_url = fun.reduce(
-                        function(r, k, v)
-                            r[k] = v
-                            return r
-                        end,
-                        parsed_url,
-                        val.variables
-                    )
-                else
-                    parsed_url = neturl.parse(val.url)
+                        for _, param in next, server_params do
+                            local pattern = ("{%s}"):format(param)
+                            local value = assert(
+                                val.variables[param],
+                                ("Variable %q is not set for %s server options"):format(param, app_config.__name)
+                            )
+
+                            value = value:strip("/")
+
+                            val.url = val.url:gsub(pattern, value)
+                        end
+
+                        parsed_url = neturl.parse(val.url)
+
+                        parsed_url = fun.reduce(
+                            function(r, k, v)
+                                r[k] = v
+                                return r
+                            end,
+                            parsed_url,
+                            val.variables
+                        )
+                    else
+                        parsed_url = neturl.parse(val.url)
+                    end
+
+                    return parsed_url
                 end
+            ):totable()
 
-                return parsed_url
+            local _, settings = next(current)
+
+            if not settings then
+                error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
             end
-        ):totable()
 
-        local _, settings = next(current)
+            self.server_settings = settings
 
-        if not settings then
-            error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
+            return settings
         end
-
-        return settings
     end
 
     function self:parse_paths()
-        local result = {}
-        for path, methods in next, self.paths do
-            fun.map(
-                function(method, opts)
-                    local options = table.deepcopy(opts)
-                    options.method = method
-                    options.path = path
-                    return options
-                end,
-                methods
-            ):reduce(
-                function(res, opts)
-                    opts.tags = opts.tags or {"default"}
+        local parsed = {}
 
-                    -- gets the first tag from value
-                    local _, tag = next(opts.tags)
-                    local method = opts.method:upper()
-                    if not tag then
-                        return res
-                    end
-
-                    local controller = tag
-                    if opts.operationId then
-                        controller = ("%s#%s"):format(tag, opts.operationId)
-                    end
-
-                    local auth = opts.security and self:parse_security_schemes(opts.security) or nil
-
-                    local _path = self:form_path(
-                        path,
-                        method
-                    )
-
-                    table.insert(res, {
-                        options = {
-                            settings     = opts['x-settings'],
-                            method       = method,
-                            path         = util.parse_path(_path),
-                            openapi_path = path,
-                            security     = auth
-                        },
-                        controller = controller
-                    })
-                    return res
-                end,
-                result
-            )
+        if self.bound then
+            return parsed
         end
+
+        fun.reduce(
+            function(_r, path, methods)
+                fun.map(
+                    function(method, opts)
+                        local options = table.deepcopy(opts)
+                        options.method = method
+                        path = self.base_path and fio.pathjoin(self.base_path, path) or path
+                        return options
+                    end,
+                    methods
+                ):reduce(
+                    function(res, opts)
+                        opts.tags = opts.tags or { "default" }
+
+                        -- gets the first tag from value
+                        local _, tag = next(opts.tags)
+                        local method = opts.method:upper()
+                        if not tag then
+                            return res
+                        end
+
+                        local controller = tag
+                        if opts.operationId then
+                            controller = ("%s#%s"):format(tag, opts.operationId)
+                        end
+
+                        local auth = opts.security and self:parse_security_schemes(opts.security) or nil
+
+                        -- set fullPath option for secondary schemas with path option set
+                        if self.base_path then
+                            opts['x-settings'] = opts['x-settings'] or {}
+                            opts['x-settings'].fullPath = true
+                        end
+
+                        local _path = self:form_path(
+                            path,
+                            method
+                        )
+
+                        table.insert(res, {
+                            options = {
+                                settings = opts['x-settings'],
+                                method = method,
+                                path = util.parse_path(_path),
+                                openapi_path = path,
+                                uid_schema = self.uid_schema,
+                                security = auth
+                            },
+                            controller = controller
+                        })
+                        return res
+                    end,
+                    parsed
+                )
+
+                rawset(_r, path, methods)
+
+                return _r
+            end,
+            self.paths,
+            self.paths
+        )
 
         if self.security then
             self.global_security = self:parse_security_schemes(self.security)
         end
 
-        return result
+        return parsed
     end
 
     function self:parse_security_schemes(scheme)
@@ -312,7 +870,7 @@ function _M:new(spec)
 
         local key, scope = next(v)
         local options
-        if self.components.securitySchemes then
+        if self.components and self.components.securitySchemes then
             options = self.components.securitySchemes[key]
             if not options then
                 error(
@@ -401,7 +959,13 @@ function _M:new(spec)
         return result
     end
 
-    function self:ref(str)
+    function self:ref(str, uid)
+        if uid then
+            local _schema = self:get_secondary(uid)
+
+            return _schema:ref(str)
+        end
+
         local pathtab = str:match("#%/(.+)"):split("/")
         return fun.reduce(
             function(res, v)
@@ -459,7 +1023,7 @@ function _M:new(spec)
 
         local settings = opts[method]['x-settings'] or {}
 
-        if self.server_settings.path and not settings.fullPath then
+        if self.server_settings and self.server_settings.path and not settings.fullPath then
             local res = self.join_path(self.server_settings.path, unpack(relpath:split("/")))
             return res
         end
@@ -503,6 +1067,7 @@ function _M:new(spec)
     return obj
 end
 
+-- prometheus handlers
 function _P.bind_metrics(httpd)
     local router = assert(httpd:router(), "router is not set")
     local prefix = assert(httpd.options.metrics.prefix, "Please set 'prefix' options for your metrics config")
@@ -858,6 +1423,15 @@ function _U.bind_security(ctx)
         end
 
         if auth_handler then
+            if not security.options and ctx.endpoint.uid_schema then
+                local _s  = httpd.openapi:get_secondary(ctx.endpoint.uid_schema)
+                local _ps = assert(_s.paths[ctx.endpoint.openapi_path], "path unknown")
+                local _ms = assert(_ps[ctx.endpoint.method:lower()], "unknown method")
+
+                ctx.endpoint.security = httpd.openapi:parse_security_schemes(_ms.security)
+                security = ctx.endpoint.security
+            end
+
             local scheme = security.options.scheme or security.options.type
             local auth_data, additional = _U[scheme](ctx, security.options.name, security.options['in'])
             if not auth_data then
@@ -970,342 +1544,7 @@ _U.ni_patterns = {
 }
 
 
--- validation functions
-function _V.validate(ctx)
-    local c, a = ctx.endpoint.controller, ctx.endpoint.action
-
-    local ctype = ctx:header("content-type")
-    local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
-
-    if not req_path then
-        return
-    end
-
-    if ctype then
-        local with_charset = ctype:match("(%S+)[;]:?")
-
-        if with_charset then
-            ctype = with_charset
-        end
-    end
-
-    local httpd = ctx['tarantool.http.httpd']
-
-    local has, err = httpd.openapi:has_params(req_path, method, ctype)
-
-    if err then
-        return {err}
-    end
-
-    if not has then
-        return {}
-    end
-
-    httpd.cache = httpd.cache or {}
-
-    if not httpd.cache.params then
-        httpd.cache.params = {}
-    end
-
-    local cache = httpd.cache.params[c]
-
-    if not cache then
-        httpd.cache.params[c] = {}
-    end
-
-    cache = not a and cache or httpd.cache.params[c][a]
-
-    if not cache then
-        if a then
-            httpd.cache.params[c][a] = {}
-            cache = httpd.cache.params[c][a]
-        else
-            httpd.cache.params[c] = {}
-            cache = httpd.cache.params[c]
-        end
-    end
-
-    if not next(cache) then
-        local params, p_err = httpd.openapi:form_params(req_path, method, ctype)
-
-        if p_err then
-            error(p_err)
-        end
-
-        if action then
-            httpd.cache.params[c][a] = params
-        else
-            httpd.cache.params[c] = params
-        end
-        cache = params
-    end
-
-    local res = {}
-
-    if method ~= "get" and cache._body then
-        local post = ctx:post_param()
-
-        _V.runs = 0
-        if cache._body then
-            --[[
-                ctx arg goes last as optional, 'cause this call may execute
-                object validation as well as string or an array validation
-            ]]
-
-            if cache._body.type then
-                res = _V[cache._body.type](post, cache._body, ctx)
-            end
-
-            if _V.runs <= 0 then
-                res = next(res) and {body = res} or res
-            end
-        end
-    end
-
-    _V.validate_query(ctx, cache._query, res)
-    return res or {}
-end
-
-function _V.validate_query(ctx, spec, res)
-    local query = ctx:query_param()
-    local stash = ctx.endpoint.stash
-
-    if next(stash) then
-        stash = fun.map(
-            function(name)
-                return name, stash[name]
-            end,
-            stash
-        ):tomap()
-    end
-
-    if not next(spec) and (next(query) or next(stash)) then
-        return fun.chain(query, stash):reduce(
-            function(_res, key)
-                _res[key] =_V.p_error("unknown")
-                return _res
-            end,
-            res
-        )
-    else
-        fun.chain(query, stash):reduce(
-            function(_res, key)
-                if not fun.any(function(val) return val.name == key end, spec) then
-                    _res[key] = _V.p_error("unknown")
-                end
-                return _res
-            end,
-            res
-        )
-    end
-
-    return fun.reduce(
-        function(_res, param)
-            local value
-            if param['in'] == "query" then
-                value = query[param.name]
-            elseif param['in'] == "path" then
-                value = stash[param.name]
-            end
-
-            if value == nil and not param.required then
-                return _res
-            end
-
-            if not value then
-                _res[param.name] = _V.p_error("missing")
-                return _res
-            end
-
-            local vtype = param.schema.format or param.schema.type
-
-            if not _V[vtype](value) then
-                _res[param.name] = _V.p_error("invalid", vtype, type(value))
-            end
-
-            if param.schema.enum then
-                local ok = _V.enum(value, param.schema.enum)
-
-                if not ok and not param.schema.nullable then
-                    _res[param.name] = _V.p_error("invalid", param.schema.enum, value)
-                end
-            end
-
-            return _res
-        end,
-        res,
-        spec
-    )
-end
-
-function _V.object(val, spec, ctx)
-    if not _V.is_object(val) then
-        -- in case of no actual parameters and no required ones
-        if not next(val) and not spec.required then
-            return {}
-        end
-
-        local first_run = (_V.runs == 0)
-        return first_run and _V.p_error("invalid", "object", type(val)) or false
-    end
-
-    _V.runs = _V.runs + 1
-    local required = spec.required or {}
-    local obj = spec.properties
-
-    local absent = fun.map(
-        function(key, param)
-            local k, v = next(param)
-            if k == "$ref" then
-                local httpd = ctx['tarantool.http.httpd']
-                local reference = httpd.openapi:ref(v)
-                if reference then
-                    param = reference
-                    required = reference.required or {}
-                    obj[key] = param
-                end
-            end
-
-            local is_required = fun.any(
-                function(_v)
-                    return _v == key
-                end,
-                required
-            )
-
-            if is_required and not val[key] then
-                return key, _V.p_error("missing")
-            end
-            return key, nil
-        end,
-        obj
-    ):tomap()
-
-    return fun.reduce(
-        function(res, key, param)
-            if not obj[key] then
-                rawset(res, key, _V.p_error("unknown"))
-                return res
-            end
-
-            local ptype = obj[key].format or obj[key].type
-
-            local r
-
-            if ptype == "object" then
-                r = _V[ptype](val[key], obj[key], ctx)
-            else
-                r = _V[ptype](param)
-            end
-            if not r then
-                rawset(res, key, _V.p_error("invalid", ptype, type(param)))
-                return res
-            end
-
-            if type(r) == "table" and next(r) then
-                if not _V.is_object(r) then
-                    rawset(res, key, r)
-                    return res
-                end
-
-                local _t = {}
-                for k, v in next, r do
-                    rawset(_t, k, v)
-                end
-                rawset(res, key, _t)
-            end
-
-            return res
-        end,
-        absent,
-        val
-    )
-end
-
-function _V.is_object(obj)
-    if type(obj) ~= "table" then
-        return false
-    end
-    local k, v = next(obj)
-    return type(k) == "string" and v ~= nil
-end
-
-function _V.string(s)
-    return type(s) == "string"
-end
-
-_V.password = _V.string
-_V.byte     = _V.string
-_V.binary   = _V.string
-
-function _V.integer(i)
-    return type(i) == "number"
-end
-
-_V.number = _V.integer
-_V.double = _V.integer
-_V.float  = _V.integer
-_V.int32  = _V.integer
-_V.int64  = _V.integer
-
-function _V.email(email)
-    if not _V.string(email) then
-        return false
-    end
-    return email:match('[(%w+)%p*]+@[%w+%p*]+%.%a+$') ~= nil
-end
-
-function _V.uuid(str)
-    local s, res = pcall(uuid.fromstr, str)
-    return s and res ~= nil
-end
-
-function _V.array(t, param)
-    local first_run = (_V.runs == 0)
-    -- a clumsy hack
-    if type(t) ~= "table" or _V.is_object(t) then
-        return first_run and {
-            details = {
-                error    = "invalid",
-                expected = "array",
-                actual   = type(param)
-            }
-        } or false
-    end
-
-    return {}
-end
-
-function _V.enum(val, options)
-    return fun.any(function(v) return val == v end, options)
-end
-
-function _V.date(str)
-    -- lua can't match by length in any other way
-    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
-    return ok ~= nil
-end
-
-function _V.boolean(val)
-    return val == true or val == false
-end
-
-_V['date-time'] = function(str)
-    -- same here. needs some thinking maybe later
-    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
-    return ok ~= nil
-end
-
-function _V.p_error(alias, expected, actual)
-    return {
-        details = {
-            error = alias,
-            expected = expected,
-            actual = actual
-        }
-    }
-end
-
+-- automatic testing functions
 function _T.start(ctx)
     if fun.any(function(val) return val == "--test" end, arg) then
         return _T.run(ctx)
