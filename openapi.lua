@@ -711,6 +711,11 @@ function _M:new(spec, base_path, uid_schema)
             return self.__sschemas[uid]
         end
 
+        function self:get_secondary_list()
+            -- to avoid mutations
+            return table.deepcopy(self.__sschemas)
+        end
+
         function self:read_server()
             if not self.servers then
                 return {}
@@ -1823,108 +1828,127 @@ function _T.run_path_tests(ctx)
 
     print("\nRunning automatic tests:\n")
 
-    for path, options in next, ctx.openapi.paths do
-        for method, opts in next, options do
-            local settings = opts['x-settings'] or {}
-            if not settings.skipTest then
-                local headers = {}
-                local ctype
+    local schemas = {
+        ctx.openapi
+    }
 
-                if opts.security then
-                    for _, val in next, opts.security do
-                        _T.form_security(ctx, headers, val)
+    local secondary = ctx.openapi:get_secondary_list()
+
+    if secondary then
+        fun.reduce(
+            function(res, _, _schema)
+                table.insert(res, _schema)
+                return res
+            end,
+            schemas,
+            secondary
+        )
+    end
+
+    for _, schema in next, schemas do
+        for path, options in next, schema.paths do
+            for method, opts in next, options do
+                local settings = opts['x-settings'] or {}
+                if not settings.skipTest then
+                    local headers = {}
+                    local ctype
+
+                    if opts.security then
+                        for _, val in next, opts.security do
+                            _T.form_security(ctx, headers, val)
+                        end
+                    elseif ctx.openapi.security then
+                        for _, val in next, ctx.openapi.security do
+                            _T.form_security(ctx, headers, val)
+                        end
                     end
-                elseif ctx.openapi.security then
-                    for _, val in next, ctx.openapi.security do
-                        _T.form_security(ctx, headers, val)
-                    end
-                end
 
 
-                if opts.requestBody then
-                    ctype = next(opts.requestBody.content)
+                    if opts.requestBody then
+                        ctype = next(opts.requestBody.content)
 
-                    local with_charset = ctype:match("(%S+)[;]:?")
-                    if with_charset then
-                        ctype = with_charset
+                        local with_charset = ctype:match("(%S+)[;]:?")
+                        if with_charset then
+                            ctype = with_charset
+                        end
+
+                        rawset(headers, "content-type", ctype)
                     end
 
-                    rawset(headers, "content-type", ctype)
+                    local _path = schema:form_path(
+                        path,
+                        method
+                    )
+
+                    local params = schema:form_params(path, method, ctype, _path)
+
+                    local body, query = {}, {}
+
+                    if method ~= "get" and params._body then
+                        params._body.required = params._body.required or {}
+                        body = fun.map(
+                            function(name, vars)
+                                --[[
+                                    check, whether this parameter is required
+                                     then assert that it has an example value set in openapi schema
+                                     throw an error otherwise
+                                ]]
+                                if fun.any(function(val) return val == name end,params._body.required) then
+                                    local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, _path)
+                                    assert(vars.example, msg)
+                                end
+                                return name, vars.example
+                            end,
+                            params._body.properties
+                        ):tomap()
+                    end
+
+                    if params._query then
+                        query = fun.map(
+                            function(vars)
+                                local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, _path)
+                                assert(vars.schema, schema_msg)
+                                if vars.required or vars['in'] == "path" then
+                                    local msg = ("Example variable not set for the %q parameter in %s %s"):format(vars.name, method, _path)
+                                    assert(vars.schema.example, msg)
+                                end
+
+                                if vars['in'] == "query" then
+                                    return vars.name, vars.schema.example
+                                else
+                                    local pattern = ("{%s}"):format(vars.name)
+                                    _path = _path:gsub(pattern, vars.schema.example)
+                                end
+
+                                return vars,name
+                            end,
+                            params._query
+                        ):tomap()
+                    end
+
+                    -- curl takes only uppercase method, responses with protocol error otherwise
+                    method = method:upper()
+
+                    local request_data = _T.form_request(method, _path, query, body, {headers = headers})
+
+                    local resp = _T.send_request(request_data)
+
+                    _T.test:ok(resp.status == settings.testStatus or 200, ("%s %s OK STATUS"):format(method, _path))
+
+                    local resp_body = _T.json(resp)
+                    local resp_schema = opts.responses[resp.status]
+
+                    _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, _path, resp.status))
+
+                    if resp_schema then
+                        local expected = _T.form_expected(ctx, resp_schema)
+
+                        _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, _path))
+                    else
+                        print("Skipping response match. REASON: no schema\n")
+                    end
+                    print("\n")
                 end
-
-                local _path = ctx.openapi:form_path(
-                    path,
-                    method
-                )
-
-                local params = ctx.openapi:form_params(path, method, ctype, _path)
-
-                local body, query = {}, {}
-
-                if method ~= "get" and params._body then
-                    params._body.required = params._body.required or {}
-                    body = fun.map(
-                        function(name, vars)
-                            --[[
-                                check, whether this parameter is required
-                                 then assert that it has an example value set in openapi schema
-                                 throw an error otherwise
-                            ]]
-                            if fun.any(function(val) return val == name end,params._body.required) then
-                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, _path)
-                                assert(vars.example, msg)
-                            end
-                            return name, vars.example
-                        end,
-                        params._body.properties
-                    ):tomap()
-                end
-
-                if params._query then
-                    query = fun.map(
-                        function(vars)
-                            local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, _path)
-                            assert(vars.schema, schema_msg)
-                            if vars.required or vars['in'] == "path" then
-                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(vars.name, method, _path)
-                                assert(vars.schema.example, msg)
-                            end
-
-                            if vars['in'] == "query" then
-                                return vars.name, vars.schema.example
-                            else
-                                local pattern = ("{%s}"):format(vars.name)
-                                _path = _path:gsub(pattern, vars.schema.example)
-                            end
-
-                            return vars,name
-                        end,
-                        params._query
-                    ):tomap()
-                end
-
-                -- curl takes only uppercase method, responses with protocol error otherwise
-                method = method:upper()
-
-                local request_data = _T.form_request(method, _path, query, body, {headers = headers})
-
-                local resp = _T.send_request(request_data)
-
-                _T.test:ok(resp.status == settings.testStatus or 200, ("%s %s OK STATUS"):format(method, _path))
-
-                local resp_body = _T.json(resp)
-                local resp_schema = opts.responses[resp.status]
-
-                _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, _path, resp.status))
-
-                if resp_schema then
-                    local expected = _T.form_expected(ctx, resp_schema)
-
-                    _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, _path))
-                else
-                    print("Skipping response match. REASON: no schema\n")
-                end
-                print("\n")
             end
         end
     end
