@@ -177,7 +177,7 @@ function _V.validate_query(ctx, spec, res)
             if param['in'] == "query" then
                 value = query[param.name]
             elseif param['in'] == "path" then
-                value = stash[param.name]
+                value = ctx.stash[param.name]
             end
 
             if value == nil and not param.required then
@@ -808,7 +808,7 @@ function _M:new(spec, base_path, uid_schema)
                     methods
                 ):reduce(
                     function(res, opts)
-                        opts.tags = opts.tags or { "default#handle" }
+                        opts.tags = opts.tags or { "default" }
 
                         -- gets the first tag from value
                         local _, tag = next(opts.tags)
@@ -1417,8 +1417,7 @@ function _U.bind_security(ctx)
     if security ~= nil and next(security) then
         local auth_handler
         if not httpd.options.security then
-            local resp = tsgi.next(ctx)
-            return httpd.default(resp, "Security options are not specified for this server instance")
+            return httpd.default(ctx, "Security options are not specified for this server instance")
         end
 
         if type(httpd.options.security) == "table" then
