@@ -808,7 +808,7 @@ function _M:new(spec, base_path, uid_schema)
                     methods
                 ):reduce(
                     function(res, opts)
-                        opts.tags = opts.tags or { "default" }
+                        opts.tags = opts.tags or { "default#handle" }
 
                         -- gets the first tag from value
                         local _, tag = next(opts.tags)
