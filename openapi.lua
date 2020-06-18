@@ -336,7 +336,7 @@ function _V.object(val, spec, ctx)
 
             local r
 
-            if ptype == "object" then
+            if ptype == "object" or ptype == "array" then
                 r = _V[ptype](val[key], obj[key], ctx)
             else
                 r = _V[ptype](param, ctx)
@@ -1175,7 +1175,7 @@ function _U.apiKey(ctx, name, goes_in)
     elseif goes_in == "cookie" then
         local val = ctx:header("cookie")
 
-        return val and val:match(("%s=([^;]*)"):format(name)) or ""
+        return val and val:match(("%s=([^;]*)"):format(name)) or nil
     end
 end
 
