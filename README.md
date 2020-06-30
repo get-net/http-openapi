@@ -211,11 +211,11 @@ app:security_error_handler(
 
 -- override the default 404 handler if needed
 -- 404.html file form the "/templates" folder will be rendered by default
+-- the first parameter is either a function, or a boolean value
 -- the second parameter is the matching pattern
 app:not_found_handler(
     function(ctx)
         return ctx:render({
-            status = 404,
             json = {
                 success = false,
                 error   = "Not found"            
@@ -224,6 +224,10 @@ app:not_found_handler(
     end,
     "/api/v1/*path"
 )
+
+-- to render default 404 for any unmatched path
+app:not_found_handler(true)
+
 
 -- all of the request parameters validation errors would end up here
 -- by default the response in json = { error = err } with http-status of 400

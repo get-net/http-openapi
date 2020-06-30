@@ -1514,30 +1514,31 @@ function _U.httpd_bad_request_handler(self, f)
     end
 end
 
-function _U.httpd_not_found_handler(self, f, pattern)
+function _U.httpd_not_found_handler(self, f, match_pattern)
     local router = self:router()
 
     if self.http_404_swap then
         return
     end
 
-    if type(f) == "function" then
+    if f then
+        local handler = function(self)
+            local resp = type(f) == "function" and f(self) or self:render()
+            resp.status = 404
+            return resp
+        end
+
+        self.http_404_swap = true
+
         router:route(
             {
                 method = "ANY",
-                path   = pattern or "/*path"
+                file   = "404.html",
+                path   = match_pattern or "/*path"
             },
-            f
+            handler
         )
-        self.http_404_swap = true
-        return
     end
-
-    router:route({
-        path = pattern or "/*path",
-        file = "404.html"
-    })
-    self.http_404_swap = true
 end
 
 _U.ni_patterns = {
@@ -1554,7 +1555,7 @@ function _T.start(ctx)
         return _T.run(ctx)
     end
 
-    if not ctx.http_404_swap then
+    if ctx.http_404_swap then
         ctx:not_found_handler()
     end
 
