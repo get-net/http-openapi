@@ -420,7 +420,8 @@ end
 
 _V['date-time'] = function(str)
     -- same here. needs some thinking maybe later
-    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
+    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?") or
+        str:match("^(%d%d%d%d)-(%d%d)-(%d%d) (%d%d):(%d%d):(%d%d)[.(%d+):?]?")
     return ok ~= nil
 end
 
@@ -1514,10 +1515,10 @@ function _U.httpd_bad_request_handler(self, f)
     end
 end
 
-function _U.httpd_not_found_handler(self, f, match_pattern)
-    local router = self:router()
+function _U.httpd_not_found_handler(ctx, f, match_pattern)
+    local router = ctx:router()
 
-    if self.http_404_swap then
+    if ctx.http_404_swap then
         return
     end
 
@@ -1528,7 +1529,7 @@ function _U.httpd_not_found_handler(self, f, match_pattern)
             return resp
         end
 
-        self.http_404_swap = true
+        ctx.http_404_swap = true
 
         router:route(
             {
