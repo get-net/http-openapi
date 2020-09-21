@@ -3,7 +3,7 @@ version = "1.0-1"
 source = {
    url    = "git://github.com/get-net/http-openapi.git",
    branch = "master",
-   tag    = "master"
+   tag    = "1.0-1"
 }
 description = {
    summary  = "Tarantool http-server OpenAPI support wrapper",
