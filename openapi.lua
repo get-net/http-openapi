@@ -10,7 +10,11 @@ local fun           = require("fun")
 local prometheus, metrics
 
 -- lua modules
-local neturl        = require("net.url")
+local neturl_ok, neturl = pcall(require, "net.url")
+
+if not neturl_ok then
+    error("net-url not found, please install it: luarocks install net-url")
+end
 
 -- http modules
 local http_utils    = require('http.utils')
