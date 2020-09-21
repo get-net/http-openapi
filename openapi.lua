@@ -1,495 +1,50 @@
--- tnt imports
+-- tnt modules
 local base64_encode = require("digest").base64_encode
 local base64_decode = require("digest").base64_decode
+local fiber         = require('fiber')
+local tsgi          = require("http.tsgi")
 local uuid          = require("uuid")
 local fio           = require("fio")
 local fun           = require("fun")
 
+local prometheus, metrics
+
+-- lua modules
+local neturl        = require("net.url")
+
+-- http modules
+local http_utils    = require('http.utils')
+local lib           = require("http.lib")
+
 -- helpers
-local sprintf = string.format
+local util          = require("gtn.util")
 
 --[[
     set variables for test cases beforehand
     kinda lazy-loading
 ]]
-local json, tap, uri
+local json, tap
 
-local function read_spec(spec_path)
-    assert(
-        fio.path.is_file(spec_path),
-        sprintf("Spec file %s does not exist", spec_path)
-    )
-
-    local tab = spec_path:split(".")
-    local ext = tab[#tab]
-    assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
-    local decoder = require(ext)
-    local file = fio.open(spec_path, {"O_RDONLY"})
-
-    local data = file:read()
-    local status, res = pcall(decoder.decode, data)
-    assert(
-        status,
-        sprintf("Specification file %s is not valid", spec_path)
-    )
-
-    return res
-end
+local default_cors = {
+    max_age = 3600,
+    allow_credentials = true,
+    allow_headers = { "Authorization, Content-Type" },
+    allow_origin = { "*" }
+}
 
 local _M = {}
+local _P = {}
 local _V = {}
 local _U = {}
 local _T = {}
 local mt = {}
 
-function mt:__call(httpd, spec_path, options)
-    httpd.openapi = self:new(read_spec(spec_path))
-    local routes = httpd.openapi:parse_paths()
-
-    for _, v in next, routes do
-        httpd:route(v.options, v.controller)
-    end
-    httpd.options.handler = _U.handler
-
-    httpd.default                = _U.httpd_default_handler
-    httpd.error_handler          = _U.httpd_error_handler
-    httpd.security_error_handler = _U.httpd_security_error_handler
-
-    _T.httpd_start = httpd.start
-    _T.httpd_stop  = httpd.stop
-
-    httpd.start = _T.start
-
-    for k, v in next, options do
-        rawset(httpd.options, k, v)
-    end
-
-    return httpd
-end
-
-setmetatable(_M, mt)
-
-function _M:new(spec)
-    local obj = spec or {}
-
-    function self:parse_paths()
-        local result = {}
-        for path, methods in next, self.paths do
-            fun.map(
-                function(method, opts)
-                    local options = table.deepcopy(opts)
-                    options.method = method
-                    options.path = path
-                    return options
-                end,
-                methods
-            ):reduce(
-                function(res, opts)
-                    opts.tags = opts.tags or {"default"}
-                    -- gets the first tag from value
-                    local _, tag = next(opts.tags)
-                    local method = opts.method:upper()
-                    if not tag then
-                        return res
-                    end
-
-                    local controller = tag
-                    if opts.operationId then
-                        controller = sprintf("%s#%s", tag, opts.operationId)
-                    end
-
-                    local auth = opts.security and self:parse_security_schemes(opts.security) or nil
-
-                    table.insert(res, {
-                        options = {
-                            method = method,
-                            path   = self.parse_path(path),
-                            openapi_path = path,
-                            security = auth
-                        },
-                        controller = controller
-                    })
-                    return res
-                end,
-                result
-            )
-        end
-
-        if self.security then
-            self.global_security = self:parse_security_schemes(self.security)
-        end
-
-        return result
-    end
-
-    function self:parse_security_schemes(scheme)
-        local _, v = next(scheme)
-        local key, scope = next(v)
-        local options
-        if self.components.securitySchemes then
-            options = self.components.securitySchemes[key]
-            if not options then
-                error(sprintf(
-                    "Schema %s is not described in securitySchemes",
-                    key
-                ))
-            end
-        end
-        return {
-            name = key,
-            scope = scope,
-            options = options
-        }
-    end
-
-    function self:has_params(path, method, ctype)
-        if not self.paths[path] then
-            return false, "Bad Request"
-        end
-
-        if not self.paths[path][method] then
-            return false, sprintf("%s method is not supported", method:upper())
-        end
-
-        local options = self.paths[path][method]
-
-        if method == "post" then
-            if not options.requestBody then
-                return false
-            end
-
-            if not ctype then
-                return false, "No Content-Type in request"
-            end
-
-            if not options.requestBody.content[ctype] then
-                return false, sprintf("Content-type %s is not supported", ctype)
-            end
-        end
-
-        return true
-    end
-
-    function self:form_params(path, method, ctype)
-        local opts = self.paths[path]
-
-        if not opts then
-            error(("Path options not found: %s"):format(path))
-        end
-
-        local body = opts[method].requestBody
-
-        local query = opts[method].parameters
-
-        local result = {
-            query = query or {}
-        }
-
-        if body then
-            if not ctype then
-                return result
-            end
-
-            if body.content then
-                body = self:form_post(body.content[ctype].schema)
-            end
-            result.body  = body
-        end
-
-        return result
-    end
-
-    function self:form_post(parameters)
-        if type(parameters) ~= "table" then
-            return {}
-        end
-
-        local result = {}
-        for k, v in next, parameters do
-            -- in case of $ref in schema, there's no other fields, so break and go on
-            if k == "$ref" then
-                local schema = self:ref(v)
-                result = schema
-                break
-            else
-                rawset(result, k, v)
-            end
-        end
-        return result
-    end
-
-    function self:ref(str)
-        local pathtab = str:match("#%/(.+)"):split("/")
-        return fun.reduce(
-            function(res, v)
-                local field = next(res) and res[v] or self[v]
-
-                if not field then
-                    error(
-                        sprintf("Field %s was not found in reference %s", v, str)
-                    )
-                end
-                return field
-            end,
-            {},
-            pathtab
-        )
-    end
-
-    function self.validate_params(ctx)
-        local errors = _V.validate(ctx)
-
-        if next(errors) then
-            return nil, errors
-        end
-
-        return true
-    end
-
-    function self.parse_path(p)
-        local res = p
-        for path_param in p:gmatch("{(%w+)}") do
-            local sub = sprintf("{%s}", path_param)
-            res = res:gsub(sub, ":"..path_param)
-        end
-        return res
-    end
-
-    setmetatable(obj, self)
-    self.__index = self
-
-    return obj
-end
-
--- utility functions
-function _U.bearer(ctx)
-    local header = ctx.req.headers.authorization
-
-    if not header then
-        return
-    end
-
-    return header:match("Bearer (.*)")
-end
-
-function _U.basic(ctx)
-    local header = ctx.req.headers.authorization
-
-    if not header then
-        return
-    end
-
-    local creds = base64_decode(header:match("Basic (.*)"))
-    if not creds then
-        return
-    end
-    return creds:match("(%w+):(%w+)")
-end
-
-function _U.apiKey(ctx, name, goes_in)
-    if goes_in == "header" then
-        return ctx.req.headers[name:lower()]
-    elseif goes_in == "cookie" then
-        local val = ctx.req.headers["cookie"]
-
-        return val and val:match(("%s=([^;]*)"):format(name)) or ""
-    end
-end
-
-local function not_implemented(self, tag, operationId)
-    return self:render({
-        status = 501,
-        json = {
-            error       = "Not Implemented",
-            tag         = tag,
-            operationId = operationId
-        }
-    })
-end
-
-local function bad_request(self)
-    return self:render({
-        status = 400,
-        json = {
-            error = "Bad Request"
-        }
-    })
-end
-
-function _U.bind_security(ctx)
-    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and ctx.httpd.openapi.global_security)
-
-    if security ~= nil then
-        local auth_handler
-        if not ctx.httpd.options.security then
-            return nil, "Security options are not specified for this server instance"
-        end
-
-        if type(ctx.httpd.options.security) == "table" then
-            auth_handler = ctx.httpd.options.security[security.name]
-        else
-            auth_handler = ctx.httpd.options.security
-        end
-
-        if auth_handler then
-            local scheme = security.options.scheme or security.options.type
-            local auth_data, additional = _U[scheme](ctx, security.options.name, security.options['in'])
-            if not auth_data then
-                return nil, "Authorization data not found"
-            else
-                local err
-                ctx.authorization, err = auth_handler(ctx.req.path,  security.scope, auth_data, additional)
-
-                if err then
-                    return nil, err
-                end
-            end
-        else
-            return nil, "Security handler is not implemented"
-        end
-    end
-
-    return
-end
-
--- tweaked request handler
-function _U.handler(self, ctx)
-    local format = 'html'
-    local pformat = string.match(ctx.req.path, '[.]([^.]+)$')
-
-    if pformat ~= nil then
-        format = pformat
-    end
-
-    local r = self:match(ctx.req.method, ctx.req.path)
-
-    if r == nil then
-        bad_request(ctx)
-
-        return ctx.res
-    else
-        r.stash.format = format
-
-        ctx.endpoint = r.endpoint
-        ctx.tstash   = r.stash
-    end
-
-    ctx.headers = ctx.headers or {}
-
-    local _, s_err = _U.bind_security(ctx)
-    if s_err then
-        local msg = self.security_error_handler(ctx, s_err)
-        if ctx.res then
-            return ctx.res
-        end
-        return msg
-    end
-
-    if ctx.endpoint.openapi_path then
-        _, errors = ctx.httpd.openapi.validate_params(ctx)
-
-        if errors then
-            local msg = self.error_handler(ctx, errors)
-
-            if ctx.res then
-                return ctx.res
-            end
-
-            return msg
-        end
-    end
-
-    if self.hooks.before_dispatch ~= nil then
-        local _ = self.hooks.before_dispatch(ctx)
-
-        if ctx.res then
-            return ctx.res
-        end
-    end
-
-    local status, err = pcall(r.endpoint.sub, ctx)
-
-    if not status then
-        local tag, op_id
-        for _, val in next, _U.ni_patterns do
-            tag, op_id = err:match(val)
-
-            if tag ~= nil then
-                break
-            end
-        end
-
-        if tag or op_id then
-            not_implemented(ctx, tag, op_id)
-        else
-            self.error_handler(ctx, err)
-        end
-
-        return ctx.res
-    end
-
-    if self.hooks.after_dispatch ~= nil then
-        self.hooks.after_dispatch(ctx)
-    end
-
-    if not ctx.res then
-        self.default(ctx, "No Content")
-    end
-
-    return ctx.res
-end
-
-function _U.httpd_default_handler(self, f)
-    if type(f) ~= "function" then
-        return self:render({
-            status = 204,
-            json = {
-                error = f
-            }
-        })
-    end
-
-    local init = function(ctx, err)
-        return f(ctx, err)
-    end
-    self.default = init
-end
-
-function _U.httpd_error_handler(self, f, ...)
-    if type(f) ~= "function" then
-        error(f)
-    end
-
-    local init = function(ctx, err)
-        return f(ctx, err)
-    end
-    self.error_handler = init
-end
-
-function _U.httpd_security_error_handler(self, f)
-    if type(f) ~= "function" then
-        error(f)
-    end
-
-    local init = function(ctx, err)
-        return f(ctx, err)
-    end
-    self.security_error_handler = init
-end
-
-_U.ni_patterns = {
-    [[Can't load module "(.*)": "(.*)"]],
-    [[Controller "(.*)" doesn't contain function "(.*)"]],
-    [[require "(.*)" didn't return table]],
-    [[Controller "(.*)" is not a function]]
-}
-
-
 -- validation functions
 function _V.validate(ctx)
     local c, a = ctx.endpoint.controller, ctx.endpoint.action
-    local ctype = ctx.req.headers['content-type']
-    local req_path, method = ctx.endpoint.openapi_path, ctx.req.method:lower()
+
+    local ctype = ctx:header("content-type")
+    local req_path, method = ctx.endpoint.openapi_path, ctx:method():lower()
 
     if not req_path then
         return
@@ -503,7 +58,12 @@ function _V.validate(ctx)
         end
     end
 
-    local has, err = ctx.httpd.openapi:has_params(req_path, method, ctype)
+    local httpd = ctx['tarantool.http.httpd']
+
+    local schema = ctx.endpoint.uid_schema and
+        httpd.openapi:get_secondary(ctx.endpoint.uid_schema) or httpd.openapi
+
+    local has, err = schema:has_params(req_path, method, ctype)
 
     if err then
         return {err}
@@ -513,56 +73,59 @@ function _V.validate(ctx)
         return {}
     end
 
-    if not ctx.httpd.cache.params then
-        ctx.httpd.cache.params = {}
+    httpd.cache = httpd.cache or {}
+
+    if not httpd.cache.params then
+        httpd.cache.params = {}
     end
 
-    local cache = ctx.httpd.cache.params[c]
+    local cache = httpd.cache.params[c]
 
     if not cache then
-        ctx.httpd.cache.params[c] = {}
+        httpd.cache.params[c] = {}
     end
 
-    cache = not a and cache or ctx.httpd.cache.params[c][a]
+    cache = not a and cache or httpd.cache.params[c][a]
 
     if not cache then
         if a then
-            ctx.httpd.cache.params[c][a] = {}
-            cache = ctx.httpd.cache.params[c][a]
+            httpd.cache.params[c][a] = {}
+            cache = httpd.cache.params[c][a]
         else
-            ctx.httpd.cache.params[c] = {}
-            cache = ctx.httpd.cache.params[c]
+            httpd.cache.params[c] = {}
+            cache = httpd.cache.params[c]
         end
     end
 
     if not next(cache) then
-        local params, p_err = ctx.httpd.openapi:form_params(req_path, method, ctype)
+        local params, p_err = schema:form_params(req_path, method, ctype)
 
         if p_err then
             error(p_err)
         end
 
         if action then
-            ctx.httpd.cache.params[c][a] = params
+            httpd.cache.params[c][a] = params
         else
-            ctx.httpd.cache.params[c] = params
+            httpd.cache.params[c] = params
         end
         cache = params
     end
 
     local res = {}
 
-    if method ~= "get" and cache.body then
+    if method ~= "get" and cache._body then
         local post = ctx:post_param()
 
         _V.runs = 0
-        if cache.body then
+        if cache._body then
             --[[
                 ctx arg goes last as optional, 'cause this call may execute
                 object validation as well as string or an array validation
             ]]
-            if cache.body.type then
-                res = _V[cache.body.type](post, cache.body, ctx)
+
+            if cache._body.type then
+                res = _V[cache._body.type](post, cache._body, ctx)
             end
 
             if _V.runs <= 0 then
@@ -571,7 +134,7 @@ function _V.validate(ctx)
         end
     end
 
-    _V.validate_query(ctx, cache.query, res)
+    _V.validate_query(ctx, cache._query, res)
     return res or {}
 end
 
@@ -582,7 +145,7 @@ function _V.validate_query(ctx, spec, res)
     if next(stash) then
         stash = fun.map(
             function(name)
-                return name, ctx:stash(name)
+                return name, stash[name]
             end,
             stash
         ):tomap()
@@ -614,7 +177,7 @@ function _V.validate_query(ctx, spec, res)
             if param['in'] == "query" then
                 value = query[param.name]
             elseif param['in'] == "path" then
-                value = stash[param.name]
+                value = ctx.stash[param.name]
             end
 
             if value == nil and not param.required then
@@ -647,8 +210,77 @@ function _V.validate_query(ctx, spec, res)
     )
 end
 
+function _V.array(t, spec, ctx)
+    local first_run = (_V.runs == 0)
+
+    if type(t) ~= "table" or _V.is_object(t) then
+        return first_run and {
+            details = {
+                error    = "invalid",
+                expected = "array",
+                actual   = type(t)
+            }
+        } or false
+    end
+
+    spec = spec.items
+    local pkey, pval = next(spec)
+
+    if pkey == "$ref" then
+        local httpd = ctx['tarantool.http.httpd']
+        local uid_schema = ctx.endpoint.uid_schema
+
+        local reference = httpd.openapi:ref(pval, uid_schema)
+        if reference then
+            spec = reference
+            required = reference.required or {}
+        end
+    end
+
+    local res = fun.reduce(
+        function(res, val)
+            local ptype = spec.format or spec.type
+
+            local r
+            if ptype == "object" then
+                r = _V[ptype](val, spec, ctx)
+            else
+                r = _V[ptype](val)
+            end
+
+            if not r then
+                table.insert(res, _V.p_error("invalid", ptype, type(val)))
+                return res
+            end
+
+            if type(r) == "table" and next(r) then
+                if not _V.is_object(r) then
+                    table.insert(res, r)
+                    return res
+                end
+
+                local _t = {}
+                for k, v in next, r do
+                    rawset(_t, k, v)
+                end
+                table.insert(res, _t)
+            end
+
+            return res
+        end,
+        {},
+        t
+    )
+
+    return res
+end
+
 function _V.object(val, spec, ctx)
     if not _V.is_object(val) then
+        if type(val) ~= "table" then
+            return _V.p_error("invalid", "object", type(val))
+        end
+
         -- in case of no actual parameters and no required ones
         if not next(val) and not spec.required then
             return {}
@@ -666,7 +298,11 @@ function _V.object(val, spec, ctx)
         function(key, param)
             local k, v = next(param)
             if k == "$ref" then
-                local reference = ctx.httpd.openapi:ref(v)
+                local httpd = ctx['tarantool.http.httpd']
+                local uid_schema = ctx.endpoint.uid_schema
+
+                -- fetches secondary schema's refs
+                local reference = httpd.openapi:ref(v, uid_schema)
                 if reference then
                     param = reference
                     required = reference.required or {}
@@ -700,10 +336,10 @@ function _V.object(val, spec, ctx)
 
             local r
 
-            if ptype == "object" then
+            if ptype == "object" or ptype == "array" then
                 r = _V[ptype](val[key], obj[key], ctx)
             else
-                r = _V[ptype](param)
+                r = _V[ptype](param, ctx)
             end
             if not r then
                 rawset(res, key, _V.p_error("invalid", ptype, type(param)))
@@ -750,6 +386,7 @@ function _V.integer(i)
     return type(i) == "number"
 end
 
+_V.number = _V.integer
 _V.double = _V.integer
 _V.float  = _V.integer
 _V.int32  = _V.integer
@@ -765,22 +402,6 @@ end
 function _V.uuid(str)
     local s, res = pcall(uuid.fromstr, str)
     return s and res ~= nil
-end
-
-function _V.array(t, param)
-    local first_run = (_V.runs == 0)
-    -- a clumsy hack
-    if type(t) ~= "table" or _V.is_object(t) then
-        return first_run and {
-            details = {
-                error    = "invalid",
-                expected = "array",
-                actual   = type(param)
-            }
-        } or false
-    end
-
-    return {}
 end
 
 function _V.enum(val, options)
@@ -799,9 +420,41 @@ end
 
 _V['date-time'] = function(str)
     -- same here. needs some thinking maybe later
-    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?")
+    local ok = str:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)[.(%d+):?]?") or
+        str:match("^(%d%d%d%d)-(%d%d)-(%d%d) (%d%d):(%d%d):(%d%d)[.(%d+):?]?")
     return ok ~= nil
 end
+
+-- template for filetype validation
+local fileformat = {
+    type     = "object",
+    required = {"data"},
+    properties = {
+        data = {
+            type = "string"
+        },
+        headers = {
+            type = "object",
+            properties = {
+                filename = {
+                    type = "string"
+                },
+                name = {
+                    type = "string"
+                }
+            }
+        },
+        mime = {
+            type = "string"
+        }
+    }
+}
+
+function _V.binary(obj, ctx)
+    return _V.object(obj, fileformat, ctx)
+end
+
+_V.byte = _V.binary
 
 function _V.p_error(alias, expected, actual)
     return {
@@ -813,9 +466,1098 @@ function _V.p_error(alias, expected, actual)
     }
 end
 
+local function read_specfile(filepath)
+    assert(
+        fio.path.is_file(filepath),
+        ("Spec file %s does not exist"):format(filepath)
+    )
+
+    local tab = filepath:split(".")
+    local ext = tab[#tab]
+    assert(ext == "yaml" or ext == "json", "Invalid openapi file extension")
+    local decoder = require(ext)
+    local file = fio.open(filepath, {"O_RDONLY"})
+
+    local data = file:read()
+    local status, res = pcall(decoder.decode, data)
+    assert(
+        status,
+        ("Specification file %s is not valid"):format(filepath)
+    )
+
+    return res
+end
+
+--[[
+    initial primary schema mutation. NOTE: this is not copying
+    it's changes the original schema
+]]
+local function join_schemas(primary, secondary, field )
+    primary[field]   = primary[field] or {}
+    secondary[field] = secondary[field] or {}
+
+    primary[field] = fun.reduce(
+        function(res, k ,v)
+            -- does not override primary options with secondary ones
+            if not res[k] then
+                rawset(res, k ,v)
+            end
+
+            return res
+        end,
+        primary[field],
+        secondary[field]
+    )
+end
+
+local function bind_routes(httpd)
+    local router = httpd:router()
+
+    local routes = httpd.openapi:parse_paths()
+
+    if httpd.openapi.__sschemas then
+        -- set additional routes from secondary schemas and bind them
+        local additional_routes = fun.reduce(
+            function(res, _, _schema)
+                local _paths  = _schema:parse_paths(uid)
+
+                table.insert(res, _paths)
+                _schema.bound = true
+                return res
+            end,
+            {},
+            httpd.openapi.__sschemas
+        )
+
+        if next(additional_routes) then
+            routes = fun.chain(routes, unpack(additional_routes)):totable()
+        end
+
+        httpd.openapi.bound = true
+    end
+
+    for _, v in next, routes do
+        if v.options.security or httpd.openapi.global_security then
+            router:use(
+                _U.bind_security,
+                {
+                    preroute = true,
+                    name     = "authenticate#"..v.controller,
+                    method   = v.options.method,
+                    path     = v.options.path
+                }
+            )
+        end
+
+        router:use(
+            httpd.openapi.validate_params,
+            {
+                preroute = true,
+                name     = "validate#"..v.controller,
+                method   = v.options.method,
+                path     = v.options.path
+            }
+        )
+
+        if httpd.options.cors then
+            router:use(
+                _U.handle_cors,
+                {
+                    preroute = true,
+                    name     = "cors#"..v.controller,
+                    method   = "ANY",
+                    path     = v.options.path
+                }
+            )
+        end
+
+        router:route(v.options, v.controller)
+    end
+end
+
+function mt:__call(httpd, router, spec_conf, options)
+    local openapi
+    if not app_config then
+        util.read_config()
+    end
+
+    local server_settings
+    if type(spec_conf) == "string" then
+        openapi = self:new(read_specfile(spec_conf))
+        server_settings = openapi:read_server()
+    end
+
+    if type(spec_conf) == "table" then
+        assert(_V.is_object(spec_conf), "schema options must be a hash map or a string")
+
+        local base_path = assert(spec_conf.base_path, "base_path option is not set")
+        local primary = assert(spec_conf.primary_schema, "primary_schema option is not set")
+        local secondary_schemas = spec_conf.secondary_schemas or {}
+
+        openapi = self:new(read_specfile(fio.pathjoin(base_path, primary)))
+
+        -- moved this call here to have a possibility of setting relative schemas
+        server_settings = openapi:read_server()
+
+        for _, opts in next, secondary_schemas do
+            openapi:add_schema(fio.pathjoin(base_path, opts.schema), opts.path, opts.relative)
+        end
+    end
+
+    if not server_settings.socket then
+        -- overrides server settings from openapi schema sets 8080 as a default port if not set
+        httpd = httpd.new(server_settings.host, server_settings.port or 8080, app_config.server_options)
+    else
+        local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
+            server_settings.socket
+        httpd = httpd.new("unix/", out_port, app_config.server_options)
+    end
+
+    httpd.openapi = openapi
+
+    router = router.new(app_config.server)
+
+    httpd:set_router(router)
+
+    for k, v in next, options do
+        if k == "cors" then
+            assert(type(v) == "table", "CORS option must be a table")
+            local _cors = default_cors
+
+            for key, val in next, v do
+                if not default_cors[key] then
+                    error(("Unsupported CORS option %s"):format(key))
+                end
+
+                if type(val) ~= type(default_cors[key]) then
+                    local msg = ("Invalid type for option %s. Expected %s got %s"):format(
+                        k,
+                        type(default_cors[key]),
+                        type(v)
+                    )
+                    error(msg)
+                end
+                rawset(_cors, key, val)
+            end
+
+            v = _cors
+        end
+
+        rawset(httpd.options, k, v)
+    end
+
+    httpd.bind_paths = bind_routes
+
+    httpd:bind_paths()
+
+    if options.metrics then
+        _P.bind_metrics(httpd)
+    end
+
+    httpd.default                 = _U.httpd_default_handler
+    httpd.error_handler           = _U.httpd_error_handler
+    httpd.not_found_handler       = _U.httpd_not_found_handler
+    httpd.bad_request_handler     = _U.httpd_bad_request_handler
+    httpd.security_error_handler  = _U.httpd_security_error_handler
+
+    _T.httpd_start = httpd.start
+    _T.httpd_stop  = httpd.stop
+
+    httpd.start = _T.start
+
+    return httpd
+end
+
+setmetatable(_M, mt)
+
+-- main openapi handler prototype
+function _M:new(spec, base_path, uid_schema)
+    local obj = spec or {}
+    obj.server_settings = {
+        path = base_path
+    }
+    obj.uid_schema = uid_schema
+    obj.bound      = false
+
+    --[[
+        those methods set only for primary schema, setting secondary schemas to secondary schemas
+        might cause some painful nesting for now
+    ]]
+    if not base_path and not uid_schema then
+        -- just some inner paths to bind child schemas
+        function self:add_schema(filepath, _path, relative)
+            local _schema = read_specfile(filepath)
+
+            if not _path then
+                join_schemas(self, _schema, "paths")
+                join_schemas(self, _schema, "components")
+                return
+            end
+
+            -- generate uid for secondary schema
+            local uid = uuid.str()
+            self.__sschemas = self.__sschemas or {}
+
+            if relative then
+                if self.server_settings and self.server_settings.path then
+                    _path = fio.pathjoin(self.server_settings.path, _path)
+                end
+            end
+
+            local _obj = _M:new(_schema, _path, uid)
+            rawset(self.__sschemas, uid, _obj)
+        end
+
+        function self:get_secondary(uid)
+            return self.__sschemas[uid]
+        end
+
+        function self:get_secondary_list()
+            -- to avoid mutations
+            return table.deepcopy(self.__sschemas)
+        end
+
+        function self:read_server()
+            if not self.servers then
+                return {}
+            end
+
+            -- form server settings and unfold variables object
+            local current = fun.filter(
+                function(val)
+                    if app_config.is_test then
+                        return val.description == "test"
+                    end
+                    return val.description == app_config.__name
+                end,
+                self.servers
+            ):map(
+                function(val)
+                    local server_params = util.read_path_parameters(val.url)
+
+                    if next(server_params) and not val.variables then
+                        error(("Server variables are not set for %q environment: %s"):format(app_config.__name, val.url))
+                    end
+
+                    local parsed_url
+                    if val.variables then
+                        val.variables = fun.map(
+                            function(k, v)
+                                return k, v.default
+                            end,
+                            val.variables
+                        ):tomap()
+
+                        for _, param in next, server_params do
+                            local pattern = ("{%s}"):format(param)
+                            local value = assert(
+                                val.variables[param],
+                                ("Variable %q is not set for %s server options"):format(param, app_config.__name)
+                            )
+
+                            value = value:strip("/")
+
+                            val.url = val.url:gsub(pattern, value)
+                        end
+
+                        parsed_url = neturl.parse(val.url)
+
+                        parsed_url = fun.reduce(
+                            function(r, k, v)
+                                r[k] = v
+                                return r
+                            end,
+                            parsed_url,
+                            val.variables
+                        )
+                    else
+                        parsed_url = neturl.parse(val.url)
+                    end
+
+                    return parsed_url
+                end
+            ):totable()
+
+            local _, settings = next(current)
+
+            if not settings then
+                error(("\nServer settings for %s are not set.\n"):format(app_config.__name))
+            end
+
+            self.server_settings = settings
+
+            return settings
+        end
+    end
+
+    function self:parse_paths()
+        local parsed = {}
+
+        if self.bound then
+            return parsed
+        end
+
+        fun.reduce(
+            function(_r, path, methods)
+                fun.map(
+                    function(method, opts)
+                        local options = table.deepcopy(opts)
+                        options.method = method
+                        path = self.base_path and fio.pathjoin(self.base_path, path) or path
+                        return options
+                    end,
+                    methods
+                ):reduce(
+                    function(res, opts)
+                        opts.tags = opts.tags or { "default" }
+
+                        -- gets the first tag from value
+                        local _, tag = next(opts.tags)
+                        local method = opts.method:upper()
+                        if not tag then
+                            return res
+                        end
+
+                        local controller = tag
+                        if opts.operationId then
+                            controller = ("%s#%s"):format(tag, opts.operationId)
+                        end
+
+                        local auth = opts.security and self:parse_security_schemes(opts.security) or nil
+
+                        -- set fullPath option for secondary schemas with path option set
+                        if self.base_path then
+                            opts['x-settings'] = opts['x-settings'] or {}
+                            opts['x-settings'].fullPath = true
+                        end
+
+                        local _path = self:form_path(
+                            path,
+                            method
+                        )
+
+                        table.insert(res, {
+                            options = {
+                                settings = opts['x-settings'],
+                                method = method,
+                                path = util.parse_path(_path),
+                                openapi_path = path,
+                                uid_schema = self.uid_schema,
+                                security = auth
+                            },
+                            controller = controller
+                        })
+                        return res
+                    end,
+                    parsed
+                )
+
+                rawset(_r, path, methods)
+
+                return _r
+            end,
+            self.paths,
+            self.paths
+        )
+
+        if self.security then
+            self.global_security = self:parse_security_schemes(self.security)
+        end
+
+        return parsed
+    end
+
+    function self:parse_security_schemes(scheme)
+        local _, v = next(scheme)
+
+        if not v then
+            return {}
+        end
+
+        local key, scope = next(v)
+        local options
+        if self.components and self.components.securitySchemes then
+            options = self.components.securitySchemes[key]
+            if not options then
+                error(
+                    ("Schema %s is not described in securitySchemes"):format(key)
+                )
+            end
+        end
+        return {
+            name = key,
+            scope = scope,
+            options = options
+        }
+    end
+
+    function self:has_params(path, method, ctype)
+        if not self.paths[path] then
+            return false, "Bad Request"
+        end
+
+        if not self.paths[path][method] then
+            return false, ("%s method is not supported"):format(method:upper())
+        end
+
+        local options = self.paths[path][method]
+
+        if method == "post" then
+            if not options.requestBody then
+                return false
+            end
+
+            if not ctype then
+                return false, "No Content-Type in request"
+            end
+
+            if not options.requestBody.content[ctype] then
+                return false, ("Content-type %s is not supported"):format(ctype)
+            end
+        end
+
+        return true
+    end
+
+    function self:form_params(path, method, ctype)
+        local opts = self.paths[path]
+
+        if not opts then
+            error(("Path options not found: %s"):format(path))
+        end
+
+        local body = opts[method].requestBody
+
+        local query = opts[method].parameters
+
+        local result = {
+            _query = query or {}
+        }
+
+        if body then
+            if not ctype then
+                return result
+            end
+
+            body = self:form_post(body.content[ctype].schema)
+            result._body  = body
+        end
+
+        return result
+    end
+
+    function self:form_post(parameters)
+        if type(parameters) ~= "table" then
+            return {}
+        end
+
+        local result = {}
+        for k, v in next, parameters do
+            -- in case of $ref in schema, there's no other fields, so break and go on
+            if k == "$ref" then
+                local schema = self:ref(v)
+                result = schema
+                break
+            else
+                rawset(result, k, v)
+            end
+        end
+        return result
+    end
+
+    function self:ref(str, uid)
+        if uid then
+            local _schema = self:get_secondary(uid)
+
+            return _schema:ref(str)
+        end
+
+        local pathtab = str:match("#%/(.+)"):split("/")
+        return fun.reduce(
+            function(res, v)
+                local field = next(res) and res[v] or self[v]
+
+                if not field then
+                    error(
+                        ("Field %s was not found in reference %s"):format(v, str)
+                    )
+                end
+                return field
+            end,
+            {},
+            pathtab
+        )
+    end
+
+    function self.validate_params(ctx)
+        local self = ctx:router()
+
+        local r = self:match(ctx:method(), ctx:path())
+        ctx.endpoint = r.endpoint
+        ctx.stash    = r.stash
+
+        _U.post_param(ctx)
+
+        if not ctx.render_swap then
+            _U.render(ctx)
+        end
+
+        if not ctx.handler_swap then
+            _U.handler(ctx)
+        end
+
+        ctx.query_param = _U.query_param
+
+        local errors = _V.validate(ctx)
+
+        if next(errors) then
+            local httpd = ctx['tarantool.http.httpd']
+
+            return httpd.bad_request_handler(ctx, errors)
+        end
+
+        return tsgi.next(ctx)
+    end
+
+    function self:form_path(relpath, method)
+        method = method:lower()
+        local opts = self.paths[relpath]
+
+        if not opts then
+            error(("options for %s not found"):format(relpath))
+        end
+
+        local settings = opts[method]['x-settings'] or {}
+
+        if self.server_settings and self.server_settings.path and not settings.fullPath then
+            local res = self.join_path(self.server_settings.path, unpack(relpath:split("/")))
+            return res
+        end
+
+        return relpath
+    end
+
+    function self.join_path(base, ...)
+        if not type(base) == "string" then
+            error("First argument must be a string")
+        end
+
+        local parsed = neturl.parse(base)
+
+        parsed.path = fun.reduce(
+            function(res, val)
+                if #val > 0 then
+                    if not res:endswith("/") and not val:startswith("/") then
+                        res = res.."/"
+                    end
+
+                    if res:endswith("/") and val:startswith("/") then
+                        val = val:sub(2, #val)
+                    end
+
+                    res = res .. val
+                end
+
+                return res
+            end,
+            parsed.path,
+            {...}
+        )
+
+        return tostring(parsed:normalize())
+    end
+
+    setmetatable(obj, self)
+    self.__index = self
+
+    return obj
+end
+
+-- prometheus handlers
+function _P.bind_metrics(httpd)
+    local router = assert(httpd:router(), "router is not set")
+    local prefix = assert(httpd.options.metrics.prefix, "Please set 'prefix' options for your metrics config")
+    local path = httpd.options.metrics.path
+    local options = httpd.options.metrics.collect
+
+    local status, _p = pcall(require, "prometheus")
+
+    assert(status, "Prometheus module is not installed")
+
+    prometheus = _p
+
+    if options and type(options) == "table" then
+        for _, opt in next, options do
+            if opt.watch then
+                opt.type = "counter"
+            end
+
+            local operation = assert(prometheus[opt.type], ("Invalid metric type %s"):format(opt.type))
+
+            local _op = operation(("%s_%s"):format(prefix, opt.name), opt.description)
+
+            if opt.type == "gauge" and opt.call then
+                assert(type(opt.call == "function"), ("call option is not a function for %s"):format(opt.name))
+
+                local handle = _P.fiber_operation
+
+                fiber.create(handle, _op, opt.call, opt.step)
+            end
+
+            if opt.watch then
+                local cont = function(env)
+                    _op:inc(1)
+                    return tsgi.next(env)
+                end
+
+                router:use(
+                    cont,
+                    {
+                        name     = "metrics#"..opt.watch,
+                        method   = opt.method,
+                        path     = opt.watch
+                    }
+                )
+            end
+        end
+    end
+
+    metrics = {
+        security_errors = prometheus.counter(("%s_security_errors"):format(prefix), "Security error counter"),
+        errors          = prometheus.counter(("%s_unhandled_errors"):format(prefix), "Unhandled error counter")
+    }
+
+    router:route({
+        path = path
+    },
+        prometheus.collect_http
+    )
+end
+
+function _P.fiber_operation(operation, f, step)
+    while true do
+        local val = f()
+
+        operation:set(val)
+        fiber.sleep(step or 15)
+    end
+end
+
+
+-- utility functions
+function _U.bearer(ctx)
+    local header = ctx:header("authorization")
+
+    if not header then
+        return
+    end
+
+    return header:match("Bearer (.*)")
+end
+
+function _U.basic(ctx)
+    local header = ctx:header("authorization")
+
+    if not header then
+        return
+    end
+
+    local creds = base64_decode(header:match("Basic (.*)"))
+    if not creds then
+        return
+    end
+    return creds:match("(%w+):(%w+)")
+end
+
+function _U.apiKey(ctx, name, goes_in)
+    if goes_in == "header" then
+        local n = name:lower()
+        return ctx:header(n)
+    elseif goes_in == "cookie" then
+        local val = ctx:header("cookie")
+
+        return val and val:match(("%s=([^;]*)"):format(name)) or nil
+    end
+end
+
+-- bad unescape fpr query parameters
+function _U.cached_query_param(self, name)
+    if name == nil then
+        return self.query_params
+    end
+    return self.query_params[ name ]
+end
+
+function _U.query_param(self, name)
+    if self:query() ~= nil and string.len(self:query()) == 0 then
+        rawset(self, 'query_params', {})
+    else
+        local params = lib.params(self['QUERY_STRING'])
+        local pres = {}
+        for k, v in pairs(params) do
+            pres[ http_utils.uri_unescape(k) ] = http_utils.uri_unescape(v, true)
+        end
+        rawset(self, 'query_params', pres)
+    end
+
+    rawset(self, 'query_param', _U.cached_query_param)
+    return self:query_param(name)
+end
+
+-- overrides response render handling
+function _U.render(self)
+    local render_func = self.render
+    self.render = function(ctx, input)
+        local resp = render_func(ctx, input)
+
+        resp.status = input.status
+
+        if ctx.hdrs then
+            for k, v in next, ctx.hdrs do
+                resp.headers[k] = v
+            end
+        end
+
+        if input.headers then
+            for k, v in next, input.headers do
+                resp.headers[k] = v
+            end
+        end
+
+        return resp
+    end
+    self.render_swap = true
+end
+
+-- overrides route handler with this one
+function _U.handler(self)
+    local handler_func = self.endpoint.handler
+
+    self.endpoint.handler = function(ctx)
+        local status, resp = pcall(handler_func, ctx)
+
+        local httpd = ctx['tarantool.http.httpd']
+
+        if not status then
+            local tag, op_id
+            for _, val in next, _U.ni_patterns do
+                tag, op_id = resp:match(val)
+
+                if tag ~= nil then
+                    break
+                end
+            end
+
+            if tag or op_id then
+                return util.not_implemented(ctx, tag, op_id)
+            end
+
+            return httpd.error_handler(ctx, resp)
+        end
+        if not resp then
+            return httpd.default(ctx, "No Content")
+        end
+
+        return resp
+    end
+    self.handler_swap = true
+end
+
+local function request_multipart(self)
+    local body = self:read_cached()
+
+    local sep = "--"..self:header("content-type"):match("boundary=(.+)"):gsub("-", "%%-")
+    local s, e = body:find(sep.."\r\n")
+    local eor = false
+
+    local t = {}
+
+    while not eor do
+        local _s, _e = body:find(sep, e)
+        if body:endswith("--", _e, _e + 2) then
+            eor = true
+        end
+
+        local param_part = body:match("%aontent%-%aisposition:.-; (.-)\r\n\r\n", e - 1)
+
+        -- eh. simple fix
+        if not param_part then
+            param_part = body:match("CONTENT%-DISPOSITION:.-; (.-)\r\n\r\n", e - 1)
+        end
+
+        param_part = param_part:gsub(";", "")
+
+        local mime_type = body:match("%aontent%-%aype: (.-)\r\n", e - 1)
+
+        if not mime_type then
+            mime_type = body:match("CONTENT%-TYPE: (.-)\r\n", e - 1)
+        end
+
+        local content = {}
+
+        for key, val in param_part:gmatch("(.-)=\"(.-)\"") do
+            rawset(content, key:strip(), val:strip())
+        end
+
+        local value = body:sub(e, _s - 1):match("\r\n\r\n(.-)\r\n$")
+
+        rawset(
+            t,
+            content.name,
+            content.filename and {data = value, headers = content, mime = mime_type} or value
+        )
+
+        s, e = _s, _e + 2
+    end
+
+    return t
+end
+
+-- solely to parse multipart
+function _U.post_param(self)
+    if self:content_type() == "multipart/form-data" then
+        self.post_param = function(ctx, name)
+            local params = request_multipart(ctx)
+
+            return name and params[name] or params
+        end
+    end
+end
+
+function _U.handle_cors(ctx)
+    local httpd = ctx['tarantool.http.httpd']
+    local router = ctx:router()
+
+    if not ctx.render_swap then
+        _U.render(ctx)
+    end
+
+    ctx.hdrs = {}
+
+    local req_method = ctx:header("access-control-request-method") or ctx:method()
+    local req_headers = ctx:header("access-control-request-headers")
+
+    if req_headers then
+        req_headers = req_headers:split(",")
+    end
+
+    local route = router:match(req_method, ctx:path())
+
+    if not route then
+        if ctx:method() == "OPTIONS" then
+            return ctx:render({
+                status = 201,
+                text = ""
+            })
+        end
+        return httpd.bad_request_handler(ctx)
+    end
+
+    ctx.endpoint = route.endpoint
+    ctx.stash    = route.stash
+
+    if not ctx.handler_swap then
+        _U.handler(ctx)
+    end
+
+    if fun.any(function(v) return v=="*" end, httpd.options.cors.allow_origin) then
+        ctx.hdrs["access-control-allow-origin"] = "*"
+    else
+        if fun.any(function(v) return v==ctx:header("origin") end, httpd.options.cors.allow_origin) then
+            ctx.hdrs["access-control-allow-origin"] = ctx:header("origin")
+        end
+    end
+
+    ctx.hdrs['access-control-max-age'] = httpd.options.cors.max_age
+    ctx.hdrs['access-control-allow-credentials'] = tostring(httpd.options.cors.allow_credentials)
+    ctx.hdrs['access-control-allow-headers'] = table.concat(httpd.options.cors.allow_headers, ",")
+
+    if ctx:method() == 'OPTIONS' then
+        local methods
+        if httpd.openapi then
+            local path = httpd.openapi.paths[ctx.endpoint.openapi_path]
+
+            if not path then
+                return
+            end
+
+            methods = fun.map(
+                function(k)
+                    return k:upper()
+                end,
+                path
+            ):totable()
+        else
+            methods = {ctx.endpoint.method}
+        end
+
+        if fun.any(function(val) return val == req_method end, methods) then
+            ctx.hdrs['access-control-allow-methods'] = req_method
+        end
+
+        return ctx:render({
+            status = 201,
+            text = ""
+        })
+    end
+
+    return tsgi.next(ctx)
+end
+
+function _U.bind_security(ctx)
+    local self = ctx:router()
+
+    local r = self:match(ctx:method(), ctx:path())
+    ctx.endpoint = r.endpoint
+    ctx.stash    = r.stash
+
+    local httpd = ctx['tarantool.http.httpd']
+
+    local security = ctx.endpoint.security or (ctx.endpoint.openapi_path and httpd.openapi.global_security)
+
+    if security ~= nil and next(security) then
+        local auth_handler
+        if not httpd.options.security then
+            return httpd.default(ctx, "Security options are not specified for this server instance")
+        end
+
+        if type(httpd.options.security) == "table" then
+            auth_handler = httpd.options.security[security.name]
+        else
+            auth_handler = httpd.options.security
+        end
+
+        if auth_handler then
+            if not security.options and ctx.endpoint.uid_schema then
+                local _s  = httpd.openapi:get_secondary(ctx.endpoint.uid_schema)
+                local _ps = assert(_s.paths[ctx.endpoint.openapi_path], "path unknown")
+                local _ms = assert(_ps[ctx.endpoint.method:lower()], "unknown method")
+
+                ctx.endpoint.security = httpd.openapi:parse_security_schemes(_ms.security)
+                security = ctx.endpoint.security
+            end
+
+            local scheme = security.options.scheme or security.options.type
+            local auth_data, additional = _U[scheme](ctx, security.options.name, security.options['in'])
+            if not auth_data then
+                return httpd.security_error_handler(ctx, "Authorization data not found")
+            else
+                local err
+                ctx.authorization, err = auth_handler(ctx:path(),  security.scope, auth_data, additional)
+
+                if err then
+                    return httpd.security_error_handler(ctx, err)
+                end
+            end
+        else
+            return httpd.security_error_handler(ctx, "Security handler is not implemented")
+        end
+    end
+
+    return tsgi.next(ctx)
+end
+
+function _U.httpd_default_handler(self, f)
+    if type(f) ~= "function" then
+        return self:render({
+            status = 204,
+            json = {
+                error = f
+            }
+        })
+    end
+
+    self.default = function(ctx, err)
+        return f(ctx, err)
+    end
+end
+
+function _U.httpd_error_handler(self, f, ...)
+    if type(f) ~= "function" then
+        error(f)
+    end
+
+    self.error_handler = function(ctx, err)
+        if metrics and metrics.errors then
+            metrics.errors:inc(1)
+        end
+
+        return f(ctx, err)
+    end
+end
+
+function _U.httpd_security_error_handler(self, f)
+    if type(f) ~= "function" then
+        error(f)
+    end
+
+    self.security_error_handler = function(ctx, err)
+        if metrics and metrics.security_errors then
+            metrics.security_errors:inc(1)
+        end
+
+        return f(ctx, err)
+    end
+end
+
+function _U.httpd_bad_request_handler(self, f)
+    if type(f) ~= "function" then
+        return self:render({
+            status = 400,
+            json = {
+                error = f
+            }
+        })
+    end
+
+    self.bad_request_handler = function(ctx, err)
+        return f(ctx, err)
+    end
+end
+
+function _U.httpd_not_found_handler(ctx, f, match_pattern)
+    local router = ctx:router()
+
+    if ctx.http_404_swap then
+        return
+    end
+
+    if f then
+        local handler = function(self)
+            local resp = type(f) == "function" and f(self) or self:render()
+            resp.status = 404
+            return resp
+        end
+
+        ctx.http_404_swap = true
+
+        router:route(
+            {
+                method = "ANY",
+                file   = "404.html",
+                path   = match_pattern or "/*path"
+            },
+            handler
+        )
+    end
+end
+
+_U.ni_patterns = {
+    [[Can't load module '(.*)': '(.*)']],
+    [[Controller '(.*)' doesn't contain function '(.*)']],
+    [[require '(.*)' didn't return table]],
+    [[Controller '(.*)' is not a function]]
+}
+
+
+-- automatic testing functions
 function _T.start(ctx)
     if fun.any(function(val) return val == "--test" end, arg) then
         return _T.run(ctx)
+    end
+
+    if ctx.http_404_swap then
+        ctx:not_found_handler()
     end
 
     return _T.httpd_start(ctx)
@@ -849,37 +1591,39 @@ function _T.set_env(ctx)
 
     _T.test:plan(test_count)
 
-    local server_settings = assert(ctx.openapi.servers)
-    server_settings = fun.filter(
-        function(val)
-            return val.description == "test"
-        end,
-        server_settings
-    ):totable()[1]
-
-    if not server_settings then
+    if not ctx.openapi.server_settings then
         error("Test server settings not set")
     end
 
-    _T.server_settings = uri.parse(server_settings.url)
+    _T.server_settings = ctx.openapi.server_settings
     _T.set_manual_tests()
 
     return
 end
 
 function _T.run(ctx)
+    if fun.any(function(val) return val == "coverage" end, arg)  then
+        local app_router = ctx:router()
+
+        local coverage_report = _T.coverage(app_router)
+
+        print("FAILED TOTAL: ", coverage_report.count)
+        if next(coverage_report.paths) then
+            print("FAILED PATHS: ")
+            print(table.concat(coverage_report.paths, "\n"))
+        end
+
+        os.exit(1)
+    end
+
     -- set variables set before to respective modules
-    json, tap, uri = require("json"), require("tap"), require("net.url")
+    json, tap = require("json"), require("tap")
 
     -- set local http-client instance just for testing purposes and nothing else
     _T.client = require("http.client").new({5})
 
     -- sets the testing env
     _T.set_env(ctx)
-
-    -- overrides server settings from openapi schema
-    ctx.host = _T.server_settings.host
-    ctx.port = _T.server_settings.port
 
     -- shutdown request loggin to not get unwanted io data
     ctx.options.log_requests = false
@@ -941,9 +1685,12 @@ end
 
 function _T.form_request(method, relpath, query, body, opts)
     -- reuse already parsed and existing test server options
-    local full_path = table.deepcopy(_T.server_settings)
-    full_path.path = relpath
-    full_path.query = uri.buildQuery(query)
+    local settings = table.deepcopy(_T.server_settings)
+
+    settings.path = relpath
+    settings.port = _T.server_settings.port
+    settings.path = settings.path:gsub("//", "/")
+    settings.query = neturl.buildQuery(query)
 
     if method ~= "GET" then
         if opts.headers['content-type'] == 'application/x-www-form-urlencoded' then
@@ -957,7 +1704,7 @@ function _T.form_request(method, relpath, query, body, opts)
 
     return {
         method,
-        tostring(full_path),
+        tostring(settings),
         body,
         opts
     }
@@ -1082,104 +1829,127 @@ function _T.run_path_tests(ctx)
 
     print("\nRunning automatic tests:\n")
 
-    for path, options in next, ctx.openapi.paths do
-        for method, opts in next, options do
-            if not opts['x-skip-test'] then
-                local headers = {}
-                local ctype
+    local schemas = {
+        ctx.openapi
+    }
 
-                if opts.security then
-                    for _, val in next, opts.security do
-                        _T.form_security(ctx, headers, val)
+    local secondary = ctx.openapi:get_secondary_list()
+
+    if secondary then
+        fun.reduce(
+            function(res, _, _schema)
+                table.insert(res, _schema)
+                return res
+            end,
+            schemas,
+            secondary
+        )
+    end
+
+    for _, schema in next, schemas do
+        for path, options in next, schema.paths do
+            for method, opts in next, options do
+                local settings = opts['x-settings'] or {}
+                if not settings.skipTest then
+                    local headers = {}
+                    local ctype
+
+                    if opts.security then
+                        for _, val in next, opts.security do
+                            _T.form_security(ctx, headers, val)
+                        end
+                    elseif ctx.openapi.security then
+                        for _, val in next, ctx.openapi.security do
+                            _T.form_security(ctx, headers, val)
+                        end
                     end
-                elseif ctx.openapi.security then
-                    for _, val in next, ctx.openapi.security do
-                        _T.form_security(ctx, headers, val)
-                    end
-                end
 
 
-                if opts.requestBody then
-                    ctype = next(opts.requestBody.content)
+                    if opts.requestBody then
+                        ctype = next(opts.requestBody.content)
 
-                    local with_charset = ctype:match("(%S+)[;]:?")
-                    if with_charset then
-                        ctype = with_charset
+                        local with_charset = ctype:match("(%S+)[;]:?")
+                        if with_charset then
+                            ctype = with_charset
+                        end
+
+                        rawset(headers, "content-type", ctype)
                     end
 
-                    rawset(headers, "content-type", ctype)
+                    local _path = schema:form_path(
+                        path,
+                        method
+                    )
+
+                    local params = schema:form_params(path, method, ctype, _path)
+
+                    local body, query = {}, {}
+
+                    if method ~= "get" and params._body then
+                        params._body.required = params._body.required or {}
+                        body = fun.map(
+                            function(name, vars)
+                                --[[
+                                    check, whether this parameter is required
+                                     then assert that it has an example value set in openapi schema
+                                     throw an error otherwise
+                                ]]
+                                if fun.any(function(val) return val == name end,params._body.required) then
+                                    local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, _path)
+                                    assert(vars.example, msg)
+                                end
+                                return name, vars.example
+                            end,
+                            params._body.properties
+                        ):tomap()
+                    end
+
+                    if params._query then
+                        query = fun.map(
+                            function(vars)
+                                local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, _path)
+                                assert(vars.schema, schema_msg)
+                                if vars.required or vars['in'] == "path" then
+                                    local msg = ("Example variable not set for the %q parameter in %s %s"):format(vars.name, method, _path)
+                                    assert(vars.schema.example, msg)
+                                end
+
+                                if vars['in'] == "query" then
+                                    return vars.name, vars.schema.example
+                                else
+                                    local pattern = ("{%s}"):format(vars.name)
+                                    _path = _path:gsub(pattern, vars.schema.example)
+                                end
+
+                                return vars,name
+                            end,
+                            params._query
+                        ):tomap()
+                    end
+
+                    -- curl takes only uppercase method, responses with protocol error otherwise
+                    method = method:upper()
+
+                    local request_data = _T.form_request(method, _path, query, body, {headers = headers})
+
+                    local resp = _T.send_request(request_data)
+
+                    _T.test:ok(resp.status == settings.testStatus or 200, ("%s %s OK STATUS"):format(method, _path))
+
+                    local resp_body = _T.json(resp)
+                    local resp_schema = opts.responses[resp.status]
+
+                    _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, _path, resp.status))
+
+                    if resp_schema then
+                        local expected = _T.form_expected(ctx, resp_schema)
+
+                        _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, _path))
+                    else
+                        print("Skipping response match. REASON: no schema\n")
+                    end
+                    print("\n")
                 end
-
-                local params = ctx.openapi:form_params(path, method, ctype)
-
-                local body, query = {}, {}
-
-                if method ~= "get" and params.body then
-                    params.body.required = params.body.required or {}
-                    body = fun.map(
-                        function(name, vars)
-                            --[[
-                                check, whether this parameter is required
-                                 then assert that it has an example value set in openapi schema
-                                 throw an error otherwise
-                            ]]
-                            if fun.any(function(val) return val == name end,params.body.required) then
-                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, path)
-                                assert(vars.example, msg)
-                            end
-                            return name, vars.example
-                        end,
-                        params.body.properties
-                    ):tomap()
-                end
-
-                if params.query then
-                    query = fun.map(
-                        function(vars)
-                            local schema_msg = ("Schema option not set for the %q parameter in %s %s"):format(vars.name, method, path)
-                            assert(vars.schema, schema_msg)
-                            if vars.required or vars['in'] == "path" then
-                                local msg = ("Example variable not set for the %q parameter in %s %s"):format(vars.name, method, path)
-                                assert(vars.schema.example, msg)
-                            end
-
-                            if vars['in'] == "query" then
-                                return vars.name, vars.schema.example
-                            else
-                                local pattern = ("{%s}"):format(vars.name)
-                                path = path:gsub(pattern, vars.schema.example)
-                            end
-
-                            return vars,name
-                        end,
-                        params.query
-                    ):tomap()
-                end
-
-                -- curl takes only uppercase method, responses with protocol error otherwise
-                method = method:upper()
-
-                local request_data = _T.form_request(method, path, query, body, {headers = headers})
-
-                local resp = _T.send_request(request_data)
-
-                local exp_status = opts['x-expected-status']
-
-                _T.test:ok(resp.status == exp_status or 200, ("%s %s OK STATUS"):format(method, path))
-
-                local resp_body = _T.json(resp)
-                local resp_schema = opts.responses[resp.status]
-
-                _T.test:ok(resp_schema, ("%s %s %s RESPONSE SCHEMA EXISTS"):format(method, path, resp.status))
-
-                if resp_schema then
-                    local expected = _T.form_expected(ctx, resp_schema)
-
-                    _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, path))
-                else
-                    print("Skipping response match. REASON: no schema\n")
-                end
-                print("\n")
             end
         end
     end
@@ -1195,6 +1965,37 @@ function _T.run_user_tests()
             end
         end
     end
+end
+
+function _T.coverage(app_router)
+    return fun.reduce(
+        function(res, route)
+            if route.openapi_path then
+                local status, module = pcall(require, "controllers."..route.controller)
+
+                local failed = false
+                if not status then
+                    failed = true
+                elseif route.action and not type(module) == "table" then
+                    failed = true
+                elseif route.action and not module[route.action] then
+                    failed = true
+                end
+
+                if failed then
+                    res.count = res.count + 1
+                    table.insert(res.paths, route.openapi_path)
+                end
+            end
+
+            return res
+        end,
+        {
+            count = 0,
+            paths = {}
+        },
+        app_router.routes
+    )
 end
 
 return _M
