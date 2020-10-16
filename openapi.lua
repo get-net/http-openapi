@@ -13,7 +13,7 @@ local prometheus, metrics
 local neturl_ok, neturl = pcall(require, "net.url")
 
 if not neturl_ok then
-    error("net-url not found, please install it: luarocks install net-url")
+    error("net-url not found, please install it with command: luarocks install net-url")
 end
 
 -- http modules
@@ -42,6 +42,12 @@ local _V = {}
 local _U = {}
 local _T = {}
 local mt = {}
+
+--[[
+    deafault strict validation option is false, letting it to pass
+    the unknown parameters invalidations
+]]
+_V.strict = false
 
 -- validation functions
 function _V.validate(ctx)
@@ -155,7 +161,7 @@ function _V.validate_query(ctx, spec, res)
         ):tomap()
     end
 
-    if not next(spec) and (next(query) or next(stash)) then
+    if not next(spec) and (next(query) or next(stash)) and _V.strict then
         return fun.chain(query, stash):reduce(
             function(_res, key)
                 _res[key] =_V.p_error("unknown")
@@ -166,7 +172,7 @@ function _V.validate_query(ctx, spec, res)
     else
         fun.chain(query, stash):reduce(
             function(_res, key)
-                if not fun.any(function(val) return val.name == key end, spec) then
+                if not fun.any(function(val) return val.name == key end, spec) and _V.strict then
                     _res[key] = _V.p_error("unknown")
                 end
                 return _res
@@ -331,7 +337,7 @@ function _V.object(val, spec, ctx)
 
     return fun.reduce(
         function(res, key, param)
-            if not obj[key] then
+            if not obj[key] and _V.strict then
                 rawset(res, key, _V.p_error("unknown"))
                 return res
             end
@@ -645,6 +651,10 @@ function mt:__call(httpd, router, spec_conf, options)
             end
 
             v = _cors
+        end
+
+        if k == "strict" then
+            _V.strict = v
         end
 
         rawset(httpd.options, k, v)
