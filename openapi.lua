@@ -337,8 +337,10 @@ function _V.object(val, spec, ctx)
 
     return fun.reduce(
         function(res, key, param)
-            if not obj[key] and _V.strict then
-                rawset(res, key, _V.p_error("unknown"))
+            if not obj[key] then
+                if _V.strict then
+                    rawset(res, key, _V.p_error("unknown"))
+                end
                 return res
             end
 
