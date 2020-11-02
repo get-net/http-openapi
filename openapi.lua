@@ -1143,11 +1143,13 @@ function _P.bind_metrics(httpd)
         errors          = prometheus.counter(("%s_unhandled_errors"):format(prefix), "Unhandled error counter")
     }
 
-    router:route({
-        path = path
-    },
-        prometheus.collect_http
-    )
+    if path then
+        router:route({
+            path = path
+        },
+            prometheus.collect_http
+        )
+    end
 end
 
 function _P.fiber_operation(operation, f, step)
