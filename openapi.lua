@@ -6,6 +6,7 @@ local tsgi          = require("http.tsgi")
 local uuid          = require("uuid")
 local fio           = require("fio")
 local fun           = require("fun")
+local log           = require("log")
 
 local prometheus, metrics
 
@@ -623,6 +624,31 @@ function mt:__call(httpd, router, spec_conf, options)
         local out_port = server_settings.socketPath and ("/%s/%s"):format(server_settings.socketPath, server_settings.socket) or
             server_settings.socket
         httpd = httpd.new("unix/", out_port, app_config.server_options)
+    end
+
+    if not options.debug then
+        app_config.server_options.display_errors = false
+        app_config.server_options.log_requests = false
+        app_config.server_options.log_errors = false
+        log.cfg({level = 3})
+    else
+        if options.log then
+            assert(type(options.log.file) == "string", "log.file option should be string")
+
+            if options.log.file then
+                if not fio.path.lexists(options.log.file) then
+                    local pathtab = options.log.file:split("/")
+
+                    if #pathtab > 1 then
+                        local dirs = table.concat(fun.take(#pathtab - 1, pathtab):totable(), "/")
+                        fio.mktree(dirs)
+                    end
+                end
+            end
+            log.cfg({log = options.log.file, level = options.log.level})
+        end
+        app_config.server_options.log_requests = true
+        app_config.server_options.log_errors = true
     end
 
     httpd.openapi = openapi

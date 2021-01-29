@@ -5,6 +5,7 @@ You may use your openapi specification file to map the routes and handlers insid
 ## Table of contents
 
 - [Quickstart](#quickstart)
+- [Logging](#logging)
 - [Routing](#routing)
 - [Security Example](#security-example)
 - [Describing multipart/formdata request](#describing-multipartform-data-request)
@@ -33,6 +34,41 @@ app:start()
 As you can see, openapi call takes four positional arguments, which are:
 server module, router module, path to read specification from and also a table with
 options.
+
+## Logging
+
+To log requests, errors and also show error messages on the client side, you could pass the debug options:
+
+```lua
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml",
+    {
+        security = require("authorization"),
+        debug = true
+    }
+)
+```
+
+This option will enable the logging and write it to the sysout by default.
+To pass a logfile or logging level, just add a "log" table to the options:
+
+```lua
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml",
+    {
+        security = require("authorization"),
+        log = {
+            file = "log/app.log",
+            level = 6
+        },
+        debug = true
+    }
+)
+```
 
 ## Routing
 
