@@ -20,12 +20,12 @@ You may use your openapi specification file to map the routes and handlers insid
 local openapi = require("gtn.openapi")
 
 local app = openapi(
-   require("http.server"),
-   require("http.router"),
-   "api.yaml",
-   {
-       security = require("authorization")
-   }
+    require("http.server"),
+    require("http.router"),
+    "api.yaml",
+    {
+        security = require("authorization")
+    }
 )
 
 app:start()
@@ -78,12 +78,12 @@ to map controller function to the route. For example, you wrote a `./controllers
 ```lua
 local _M = {}
 function _M.userinfo(self)
-   -- some code here
-   return self:render({
-       json = {
+    -- some code here
+    return self:render({
+        json = {
             data = user_data
-       }
-   })
+        }
+    })
 end
 
 return _M
@@ -207,18 +207,18 @@ You may also override default error handling with a function:
 local openapi = require("gtn.openapi")
 
 local app = openapi(
-   require("http.server"),
-   require("http.router"),
-   "api.yaml",
-   {
-       security = require("authorization")
-   }
+    require("http.server"),
+    require("http.router"),
+    "api.yaml",
+    {
+        security = require("authorization")
+    }
 )
 
 -- the default error override
 -- invalid repsponse format, or some crucial option that is not set for the endpoint will end up here
 app:default(
-   function(ctx, err)
+    function(ctx, err)
         return ctx:render({
             status = 204,
             json = {
@@ -227,12 +227,12 @@ app:default(
                 error   = "No Content"
             }
         })
-   end
+    end
 )
 
 -- all unexpected errors during the call of the actual handler will end up here
 app:error_handler(
-   function(ctx, err)
+    function(ctx, err)
         -- err argument here will be a table most of the time
         return ctx:render({
             json = {
@@ -240,12 +240,12 @@ app:error_handler(
                 errors  = err
             }
         })
-   end
+    end
 )
 
 -- the second return value of our `bearerAuth`, `apiKeyAuth` and `basicAuth` functions will be here
 app:security_error_handler(
-   function(ctx, err)
+    function(ctx, err)
         return ctx:render({
             status = 401,
             json = {
@@ -254,7 +254,7 @@ app:security_error_handler(
                 message = err
             }
         })
-   end
+    end
 )
 
 -- override the default 404 handler if needed
@@ -262,15 +262,15 @@ app:security_error_handler(
 -- the first parameter is either a function, or a boolean value
 -- the second parameter is the matching pattern
 app:not_found_handler(
-   function(ctx)
-       return ctx:render({
-           json = {
-               success = false,
-               error   = "Not found"
-           }
-       })
-   end,
-   "/api/v1/*path"
+    function(ctx)
+        return ctx:render({
+            json = {
+                success = false,
+                error   = "Not found"
+            }
+        })
+    end,
+    "/api/v1/*path"
 )
 
 -- to render default 404 for any unmatched path
@@ -280,16 +280,16 @@ app:not_found_handler(true)
 -- all of the request parameters validation errors would end up here
 -- by default the response in json = { error = err } with http-status of 400
 app:bad_request_handler(
-   function(ctx, err)
-       ctx:render({
-           status = 400,
-           json = {
-               success = false,
-               error   = err,
-               msg     = "Bad request"
-           }
-       })
-   end
+    function(ctx, err)
+        ctx:render({
+            status = 400,
+            json = {
+                success = false,
+                error   = err,
+                msg     = "Bad request"
+            }
+        })
+    end
 )
 ```
 
@@ -348,28 +348,28 @@ an ability to maintain several versions of your API.
 local openapi = require("gtn.openapi")
 
 local schema_options = {
-   base_path         = "schemas",
-   primary_schema    = "base.yaml",
-   secondary_schemas = {
-       {
-           schema = "api_v2.yaml",
-           path = "/api/v2",
-       },
-       {
-           schema = "api_v3.yaml"
-       },
-       {
-           schema = "relative.yaml",
-           path   = "/relative",
-           relative = true
-       }
-   }
+    base_path         = "schemas",
+    primary_schema    = "base.yaml",
+    secondary_schemas = {
+        {
+            schema = "api_v2.yaml",
+            path = "/api/v2",
+        },
+        {
+            schema = "api_v3.yaml"
+        },
+        {
+            schema = "relative.yaml",
+            path   = "/relative",
+            relative = true
+        }
+    }
 }
 
 local app = openapi(
     require("http.server"),
     require("http.router"),
-     schema_options,
+    schema_options,
     {
         security = require("authorization")
     }
@@ -396,12 +396,12 @@ You may also set new schema without changing the old-way options, just by callin
 ```lua
 -- app.lua file
 local app = openapi(
-   require("http.server"),
-   require("http.router"),
+    require("http.server"),
+    require("http.router"),
     "schema.yaml",
-   {
-       security = require("authorization")
-   }
+    {
+        security = require("authorization")
+    }
 )
 
 --[[
@@ -423,13 +423,13 @@ you have a global prefix for your API endpoints:
 
 ```yaml
 servers:
-   - url: http://localhost:{port}/{path}/
-   description: 'development'
-   variables:
-     port:
-       default: '8080'
-     path:
-       default: 'api/v1' # this one here
+  - url: http://localhost:{port}/{path}/
+  description: 'development'
+  variables:
+    port:
+      default: '8080'
+    path:
+      default: 'api/v1' # this one here
 ```
 
 And you need just a couple of enpoints to ignore this options and be outside of "/api/v1' path. It's simple: just add
@@ -559,7 +559,7 @@ To set the strict parameter validation mode set the strict parameter in options 
 local app = openapi(
     require("http.server"),
     require("http.router"),
-     "schema.yaml",
+    "schema.yaml",
     {
         security = require("authorization"),
         strict   = true
@@ -606,15 +606,53 @@ To set default CORS settings:
 local openapi = require("gtn.openapi")
 
 local app = openapi(
-   require("http.server"),
-   require("http.router"),
-   "api.yaml",
-   {
-       security = require("authorization"),
-       cors     = {} -- takes only a table value
-   }
+    require("http.server"),
+    require("http.router"),
+    "api.yaml",
+    {
+        security = require("authorization"),
+        cors     = {} -- takes only a table value
+    }
 )
 app:start()
 ```
-
 The default CORS options should suffice for the development process.
+
+There's also a way to override CORS handler for specific endpoints:
+```lua
+local app = openapi(
+    require("http.server"),
+    require("http.router"),
+    "api.yaml",
+    {
+        security = require("authorization"),
+        cors = {
+            max_age = 18600,
+            allow_credentials = false,
+            allow_headers = {"Authorization", "Content-Type", "X-Requested-With"},
+            allow_origin = {"http://example.com"},
+            specific = {
+                {
+                    -- this option obviously determines which path the current settings will be applied to
+                    path = "/some_path",
+                    -- this option disables the method check for current endpoint
+                    -- i.e it won't intercept the control if requested method is not allowed
+                    -- and also it won't set the self.hdrs table automatically
+                    skip_method = false,
+                    -- a function to override the cors handling
+                    -- you may leave it empty if there's a need to skip CORS handling at all
+                    handler = function(self)
+                        self.hdrs["access-control-allow-origin"] = "example.com"
+                        self.hdrs["access-control-allow-headers"] = "Authorization,Content-Type"
+
+                        return self:render({
+                            status = 201,
+                            text = ""
+                        })
+                    end
+                }
+            }
+        }
+    }
+)
+```

@@ -34,7 +34,8 @@ local default_cors = {
     max_age = 3600,
     allow_credentials = true,
     allow_headers = { "Authorization, Content-Type" },
-    allow_origin = { "*" }
+    allow_origin = { "*" },
+    specific = {}
 }
 
 local _M = {}
@@ -573,15 +574,63 @@ local function bind_routes(httpd)
         )
 
         if httpd.options.cors then
+            if httpd.options.cors.specific and next(httpd.options.cors.specific) then
+                local current = fun.filter(function(val)
+                    return val.path == v.options.path
+                end, httpd.options.cors.specific):totable()
+                if next(current) then
+                    current = current[1]
+
+                    if current.handler then
+                        local _h = function(ctx)
+                            if not ctx.render_swap then
+                                _U.render(ctx)
+                            end
+                            local _router = ctx:router()
+                            local req_method = ctx:header("access-control-request-method") or ctx:method()
+
+                            local route = _router:match(req_method, ctx:path())
+
+                            if not route and not current.skip_method then
+                                if ctx:method() == "OPTIONS" then
+                                    return ctx:render({
+                                        status = 201,
+                                        text = ""
+                                    })
+                                end
+                                return
+                            end
+                            ctx.hdrs = {
+                                ["access-control-request-method"] = req_method
+                            }
+
+                            return current.handler(ctx)
+                        end
+
+                        router:use(
+                            _h,
+                            {
+                                preroute = true,
+                                name = "cors#"..v.controller,
+                                method = "OPTIONS",
+                                path = v.options.path
+                            }
+                        )
+                    end
+
+                    goto skip
+                end
+            end
             router:use(
                 _U.handle_cors,
                 {
                     preroute = true,
                     name     = "cors#"..v.controller,
-                    method   = "ANY",
+                    method   = "OPTIONS",
                     path     = v.options.path
                 }
             )
+            ::skip::
         end
 
         router:route(v.options, v.controller)
@@ -671,7 +720,7 @@ function mt:__call(httpd, router, spec_conf, options)
                     local msg = ("Invalid type for option %s. Expected %s got %s"):format(
                         k,
                         type(default_cors[key]),
-                        type(v)
+                        type(val)
                     )
                     error(msg)
                 end
