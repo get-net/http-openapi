@@ -1,7 +1,7 @@
 package = "gtn-openapi"
 version = "1.1-4"
 source = {
-   url = "git+ssh://git@github.com/get-net/http-openapi.git",
+   url = "git://github.com/get-net/http-openapi.git",
    tag = "1.1-4"
 }
 description = {

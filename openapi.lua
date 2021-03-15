@@ -679,7 +679,9 @@ function mt:__call(httpd, router, spec_conf, options)
         app_config.server_options.display_errors = false
         app_config.server_options.log_requests = false
         app_config.server_options.log_errors = false
-        log.cfg({level = 3})
+        if log.cfg then
+            log.cfg({level = 3})
+        end
     else
         if options.log then
             assert(type(options.log.file) == "string", "log.file option should be string")
@@ -694,7 +696,9 @@ function mt:__call(httpd, router, spec_conf, options)
                     end
                 end
             end
-            log.cfg({log = options.log.file, level = options.log.level})
+            if log.cfg then
+                log.cfg({log = options.log.file, level = options.log.level})
+            end
         end
         app_config.server_options.log_requests = true
         app_config.server_options.log_errors = true
