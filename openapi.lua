@@ -616,9 +616,21 @@ local function bind_routes(httpd)
                                 path = v.options.path
                             }
                         )
+                        goto skip
                     end
                 end
             end
+            router:use(
+                _U.handle_cors,
+                {
+                    preroute = true,
+                    name     = "cors#"..v.controller,
+                    method   = "OPTIONS",
+                    path     = v.options.path
+                }
+            )
+            ::skip::
+
             router:use(
                 _U.handle_cors,
                 {
