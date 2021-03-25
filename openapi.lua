@@ -127,7 +127,16 @@ function _V.validate(ctx)
     local res = {}
 
     if method ~= "get" and cache._body then
-        local post = ctx:post_param()
+        local status, post = pcall(ctx.post_param, ctx)
+
+        if not status then
+            return {
+                body = {
+                    details = "failed to read the request body",
+                    expected = ctype
+                }
+            }
+        end
 
         _V.runs = 0
         if cache._body then
