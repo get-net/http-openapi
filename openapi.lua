@@ -8,7 +8,8 @@ local fio           = require("fio")
 local fun           = require("fun")
 local log           = require("log")
 
-local prometheus, metrics
+-- tnt_metrics is for tarantool metrics library, because metrics variable was already taken
+local prometheus, tnt_metrics, metrics
 
 -- lua modules
 local neturl_ok, neturl = pcall(require, "net.url")
@@ -1193,11 +1194,15 @@ function _P.bind_metrics(httpd)
     local path = httpd.options.metrics.path
     local options = httpd.options.metrics.collect
 
-    local status, _p = pcall(require, "prometheus")
+    local m_status, _m = pcall(require, "metrics")
+    assert(m_status, "metrics library is not installed")
 
-    assert(status, "Prometheus module is not installed")
+    local p_status, _p = pcall(require, "metrics.plugins.prometheus")
+
+    assert(p_status, "prometheus plugin was not found")
 
     prometheus = _p
+    tnt_metrics = _m
 
     if options and type(options) == "table" then
         for _, opt in next, options do
@@ -1205,7 +1210,7 @@ function _P.bind_metrics(httpd)
                 opt.type = "counter"
             end
 
-            local operation = assert(prometheus[opt.type], ("Invalid metric type %s"):format(opt.type))
+            local operation = assert(tnt_metrics[opt.type], ("Invalid metric type %s"):format(opt.type))
 
             local _op = operation(("%s_%s"):format(prefix, opt.name), opt.description)
 
@@ -1236,8 +1241,8 @@ function _P.bind_metrics(httpd)
     end
 
     metrics = {
-        security_errors = prometheus.counter(("%s_security_errors"):format(prefix), "Security error counter"),
-        errors          = prometheus.counter(("%s_unhandled_errors"):format(prefix), "Unhandled error counter")
+        security_errors = tnt_metrics.counter(("%s_security_errors"):format(prefix), "Security error counter"),
+        errors          = tnt_metrics.counter(("%s_unhandled_errors"):format(prefix), "Unhandled error counter")
     }
 
     if path then
