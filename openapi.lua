@@ -694,7 +694,7 @@ function mt:__call(httpd, router, spec_conf, options)
         httpd = httpd.new("unix/", out_port, app_config.server_options)
     end
 
-    if not options.debug then
+    if options.debug then
         app_config.server_options.display_errors = false
         app_config.server_options.log_requests = false
         app_config.server_options.log_errors = false
