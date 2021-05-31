@@ -451,7 +451,7 @@ an x-settings option with fullPath inside of those:
 ```
 
 It primarily has some features for automatic schema testing, that are initiated by **./app.lua --test** command. For, example,
-if you want to exclude some parts of api from being tested or you expet some other http-code in response:
+if you want to exclude some parts of api from being tested or you expect some other http-code in response:
 
 ```yaml
   /outside_path:
@@ -459,6 +459,7 @@ if you want to exclude some parts of api from being tested or you expet some oth
       x-settings:
         fullPath: true
         skipTest: true # this endpoint will skip testing
+        strict: true
   /outside_too:
     post:
       x-settings:
@@ -487,6 +488,9 @@ if you want to exclude some parts of api from being tested or you expet some oth
                     # this field is optional, but if exists, this value will be expected during auto testing
                     example: invalid parameters
 ```
+
+The **strict** option determines if it should check the response value for equality with an example value
+or should it just check that the response types match with those set in the schema.
 
 ## Check schema coverage
 

@@ -1,7 +1,8 @@
 package = "gtn-openapi"
-version = "scm-1"
+version = "1.1-7"
 source = {
-   url = "git://github.com/get-net/http-openapi.git"
+   url = "git://github.com/get-net/http-openapi.git",
+   tag = "1.1-7"
 }
 description = {
    summary  = "Tarantool http-server OpenAPI support wrapper",

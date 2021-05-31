@@ -1937,12 +1937,21 @@ function _T.form_expected(ctx, schema)
         end
 
         if is_properties then
-            rawset(result, key, val.example)
+            rawset(result, key, {value = val.example, type = val.type})
         end
     end
 
     return result
 end
+
+_T.openapi_value_map = {
+    string = "isstring",
+    number = "isnumber",
+    integer = "isnumber",
+    boolean = "isboolean",
+    array = "istable",
+    object = "isobject"
+}
 
 function _T.run_path_tests(ctx)
     _T.test_config      = require("tests.config")
@@ -2014,7 +2023,12 @@ function _T.run_path_tests(ctx)
                                      then assert that it has an example value set in openapi schema
                                      throw an error otherwise
                                 ]]
-                                if fun.any(function(val) return val == name end,params._body.required) then
+                                if fun.any(
+                                    function(val)
+                                        return settings.strict and (val == name)
+                                    end,
+                                    params._body.required
+                                ) then
                                     local msg = ("Example variable not set for the %q parameter in %s %s"):format(name, method, _path)
                                     assert(vars.example, msg)
                                 end
@@ -2064,7 +2078,22 @@ function _T.run_path_tests(ctx)
                     if resp_schema then
                         local expected = _T.form_expected(ctx, resp_schema)
 
-                        _T.test:is_deeply(resp_body, expected, ("%s %s RESPONSE MATCH"):format(method, _path))
+                        for k, v in next, expected do
+                            if settings.strict then
+                                _T.test:is_deeply(v.value, resp_body[k], ("%s %s RESPONSE MATCH"):format(method, _path))
+                            else
+                                local val_type = v.type
+                                _T.test:isstring(val_type, ("type is set for variable %q"):format(k))
+
+                                if val_type then
+                                    local call_method = _T.openapi_value_map[val_type]
+
+                                    -- some poor decisions
+                                    local calls = _G.getmetatable(_T.test)
+                                    calls.__index[call_method](_T.test, resp_body[k], ("value %q should be of the type %q"):format(k, val_type))
+                                end
+                            end
+                        end
                     else
                         print("Skipping response match. REASON: no schema\n")
                     end
