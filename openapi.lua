@@ -1026,7 +1026,7 @@ function _M:new(spec, base_path, uid_schema)
             end
 
             if not options.requestBody.content[ctype] then
-                return false, ("Content-type %s is not supported"):format(ctype)
+                return false, ("Content-Type %s is not supported"):format(ctype)
             end
         end
 
@@ -1104,23 +1104,23 @@ function _M:new(spec, base_path, uid_schema)
     end
 
     function self.validate_params(ctx)
-        local self = ctx:router()
+        local router = ctx:router()
 
-        local r = self:match(ctx:method(), ctx:path())
+        local r = router:match(ctx:method(), ctx:path())
         ctx.endpoint = r.endpoint
         ctx.stash    = r.stash
 
-        _U.post_param(ctx)
+        if ctx:content_type() == "multipart/form-data" then
+            ctx.post_param = _U.post_param(ctx)
+        end
 
         if not ctx.render_swap then
             _U.render(ctx)
         end
 
-        if not ctx.handler_swap then
+        if not ctx.endpoint.handler_swap then
             _U.handler(ctx)
         end
-
-        ctx.query_param = _U.query_param
 
         local errors = _V.validate(ctx)
 
@@ -1353,6 +1353,7 @@ end
 function _U.handler(self)
     local handler_func = self.endpoint.handler
 
+    self.endpoint.handler_swap = true
     self.endpoint.handler = function(ctx)
         local status, resp = pcall(handler_func, ctx)
 
@@ -1380,7 +1381,6 @@ function _U.handler(self)
 
         return resp
     end
-    self.handler_swap = true
 end
 
 local function request_multipart(self)
@@ -1434,14 +1434,10 @@ local function request_multipart(self)
 end
 
 -- solely to parse multipart
-function _U.post_param(self)
-    if self:content_type() == "multipart/form-data" then
-        self.post_param = function(ctx, name)
-            local params = request_multipart(ctx)
+function _U.post_param(ctx, name)
+    local params = request_multipart(ctx)
 
-            return name and params[name] or params
-        end
-    end
+    return name and params[name] or params
 end
 
 function _U.handle_cors(ctx)
@@ -1476,7 +1472,7 @@ function _U.handle_cors(ctx)
     ctx.endpoint = route.endpoint
     ctx.stash    = route.stash
 
-    if not ctx.handler_swap then
+    if not ctx.endpoint.handler_swap then
         _U.handler(ctx)
     end
 
