@@ -1,5 +1,5 @@
 package = "gtn-openapi"
-version = "scm-2"
+version = "scm-3"
 source = {
    url = "git://github.com/get-net/http-openapi.git"
 }
@@ -15,7 +15,10 @@ build = {
    type = "builtin",
 
    modules = {
-      ['gtn.openapi'] = "openapi.lua",
-      ['gtn.util'] = "util.lua"
+      ['gtn.openapi.init'] = "init.lua",
+      ['gtn.openapi.validation'] = "validation.lua",
+      ['gtn.openapi.metrics'] = "metrics.lua",
+      ['gtn.openapi.testing'] = "testing.lua",
+      ['gtn.openapi.util'] = "util.lua"
    }
 }

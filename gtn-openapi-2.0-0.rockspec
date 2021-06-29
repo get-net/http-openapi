@@ -1,8 +1,8 @@
 package = "gtn-openapi"
-version = "1.1-7"
+version = "2.0-0"
 source = {
    url = "git://github.com/get-net/http-openapi.git",
-   tag = "1.1-7"
+   tag = "2.0-0"
 }
 description = {
    summary  = "Tarantool http-server OpenAPI support wrapper",
@@ -16,7 +16,10 @@ build = {
    type = "builtin",
 
    modules = {
-      ['gtn.openapi'] = "openapi.lua",
-      ['gtn.util'] = "util.lua"
+      ['gtn.openapi.init'] = "init.lua",
+      ['gtn.openapi.validation'] = "validation.lua",
+      ['gtn.openapi.metrics'] = "metrics.lua",
+      ['gtn.openapi.testing'] = "testing.lua",
+      ['gtn.openapi.util'] = "util.lua"
    }
 }
