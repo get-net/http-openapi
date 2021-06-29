@@ -16,10 +16,10 @@ build = {
    type = "builtin",
 
    modules = {
-      ['gtn.openapi.init'] = "init.lua",
-      ['gtn.openapi.validation'] = "validation.lua",
-      ['gtn.openapi.metrics'] = "metrics.lua",
-      ['gtn.openapi.testing'] = "testing.lua",
-      ['gtn.openapi.util'] = "util.lua"
+      ['gtn.openapi.init'] = "src/init.lua",
+      ['gtn.openapi.validation'] = "src/validation.lua",
+      ['gtn.openapi.metrics'] = "src/metrics.lua",
+      ['gtn.openapi.testing'] = "src/testing.lua",
+      ['gtn.openapi.util'] = "src/util.lua"
    }
 }
