@@ -273,6 +273,10 @@ function _M.object(val, spec, ctx)
     local required = spec.required or {}
     local obj = spec.properties
 
+    if not obj then
+        return {}
+    end
+
     local absent = fun.map(
         function(key, param)
             local k, v = next(param)
