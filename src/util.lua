@@ -32,8 +32,6 @@ function _M.read_config()
     )
 end
 
-_M.read_config()
-
 function _M.read_path_parameters(path_str)
     local result = {}
     for val in path_str:gmatch("{(%w+)}") do
@@ -89,7 +87,7 @@ end
     initial primary schema mutation. NOTE: this is not copying
     it changes the original schema
 ]]
-function _M.join_schemas(primary, secondary, field )
+function _M.join_schemas(primary, secondary, field)
     primary[field]   = primary[field] or {}
     secondary[field] = secondary[field] or {}
 

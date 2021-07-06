@@ -1,3 +1,7 @@
+-- should go first
+local util          = require("gtn.openapi.util")
+util.read_config()
+
 -- tnt modules
 local tsgi          = require("http.tsgi")
 local uuid          = require("uuid")
@@ -16,7 +20,6 @@ end
 local validation    = require("gtn.openapi.validation")
 local metrics       = require("gtn.openapi.metrics")
 local testing       = require("gtn.openapi.testing")
-local util          = require("gtn.openapi.util")
 
 local default_cors = {
     max_age = 3600,
