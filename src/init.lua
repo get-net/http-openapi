@@ -610,7 +610,7 @@ function _M:new(spec, base_path, uid_schema)
         ctx.stash    = r.stash
 
         if ctx:content_type() == "multipart/form-data" then
-            ctx.post_param = util.post_param(ctx)
+            ctx.post_param = util.post_param
         end
 
         if not ctx.render_swap then
