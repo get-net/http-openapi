@@ -136,9 +136,7 @@ function _M.apiKey(ctx, name, goes_in)
         local n = name:lower()
         return ctx:header(n)
     elseif goes_in == "cookie" then
-        local val = ctx:header("cookie")
-
-        return val and val:match(("%s=([^;]*)"):format(name)) or nil
+		return ctx:cookie(name)
     end
 end
 
