@@ -2,6 +2,21 @@
 
 You may use your openapi specification file to map the routes and handlers inside your project.
 
+## ATTENTION!
+Please note, that the tarantool's [http](https://github.com/tarantool/http/tree/master)
+v2 project was [discontinued](https://github.com/tarantool/http/issues/134) due to its low
+performance. There is a specific branch now that still holds the v2 codebase and is
+available as **http-v2-legacy** package. So if you're going to update or reinstall your
+project's dependencies, be sure to run the following commands first:
+
+```bash
+tarantoolctl rocks remove http
+tarantoolctl rocks install http-v2-legacy
+```
+
+The first one is not really necessary in case if you're going to remove your project's .rocks
+folder completely
+
 ## Table of contents
 
 - [Quickstart](#quickstart)
