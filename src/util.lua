@@ -136,7 +136,7 @@ function _M.apiKey(ctx, name, goes_in)
         local n = name:lower()
         return ctx:header(n)
     elseif goes_in == "cookie" then
-		return ctx:cookie(name)
+		return ctx:cookie(name, {raw = true})
     end
 end
 
